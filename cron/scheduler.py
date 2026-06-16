@@ -1731,6 +1731,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             format_runtime_provider_error,
         )
         from hermes_cli.auth import AuthError
+        job_fallback = job.get("fallback_providers") or job.get("fallback_model")
+        config_fallback = None
+        if isinstance(_cfg, dict):
+            config_fallback = _cfg.get("fallback_providers") or _cfg.get("fallback_model")
+        fallback_model = job_fallback or config_fallback or None
+
         try:
             # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
             # already prefers persisted config over stale shell/env overrides when
@@ -1744,9 +1750,13 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except AuthError as auth_exc:
-            # Primary provider auth failed — try fallback chain before giving up.
+            # Primary provider auth failed — try the per-job fallback chain first,
+            # then the global config fallback. Several production cron jobs pin
+            # fallback_providers directly in jobs.json; ignoring that field makes
+            # their declared route look healthy in config audits while the runtime
+            # silently falls back to only the global config.
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
-            fb = _cfg.get("fallback_providers") or _cfg.get("fallback_model")
+            fb = fallback_model
             fb_list = (fb if isinstance(fb, list) else [fb]) if fb else []
             runtime = None
             for entry in fb_list:
@@ -1768,8 +1778,6 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
-
-        fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:

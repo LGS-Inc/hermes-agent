@@ -1646,6 +1646,63 @@ class TestRunJobConfigEnvVarExpansion:
             "config.yaml ${VAR} in fallback_providers was not expanded."
         )
 
+    def test_job_level_fallback_providers_are_used_when_primary_auth_fails(self, tmp_path):
+        """Cron honors per-job fallback_providers before falling back to config-only chains."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: config-fallback-should-not-win\n",
+            encoding="utf-8",
+        )
+
+        job = {
+            "id": "job-fallback",
+            "name": "job fallback test",
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "prompt": "hi",
+            "fallback_providers": [
+                {"provider": "xai", "model": "grok-4.3"},
+            ],
+        }
+        fake_db = MagicMock()
+        fallback_runtime = {
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "provider": "xai",
+            "api_mode": "chat_completions",
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=[
+                       AuthError("primary unavailable", provider="openai-codex", code="codex_auth_missing"),
+                       fallback_runtime,
+                   ]) as resolve_provider, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert resolve_provider.call_args_list[0].kwargs["requested"] == "openai-codex"
+        assert resolve_provider.call_args_list[1].kwargs["requested"] == "xai"
+        kwargs = mock_agent_cls.call_args.kwargs
+        fb = kwargs.get("fallback_model") or []
+        fb_list = fb if isinstance(fb, list) else [fb]
+        assert {"provider": "xai", "model": "grok-4.3"} in fb_list
+        assert all(
+            not (isinstance(entry, dict) and entry.get("model") == "config-fallback-should-not-win")
+            for entry in fb_list
+        )
+
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
         (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")
