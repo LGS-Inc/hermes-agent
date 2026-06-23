@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -243,8 +244,11 @@ async def test_connect_marks_retryable_fatal_error_for_startup_network_failure(m
 
 
 @pytest.mark.asyncio
-async def test_connect_clears_webhook_before_polling(monkeypatch):
-    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+async def test_connect_clears_webhook_before_polling(monkeypatch, caplog):
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="secret-token-for-log-test"))
+    monkeypatch.setenv("HERMES_TELEGRAM_GET_UPDATES_TIMEOUT", "44")
+    monkeypatch.setenv("HERMES_TELEGRAM_POLL_INTERVAL", "0.75")
+    caplog.set_level(logging.INFO)
 
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
@@ -285,6 +289,12 @@ async def test_connect_clears_webhook_before_polling(monkeypatch):
 
     assert ok is True
     bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
+    start_kwargs = updater.start_polling.await_args.kwargs
+    assert start_kwargs["timeout"] == 44.0
+    assert start_kwargs["poll_interval"] == 0.75
+    assert start_kwargs["drop_pending_updates"] is True
+    assert "secret-token-for-log-test" not in caplog.text
+    assert "Telegram transport settings" in caplog.text
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ rather than silently leaving polling dead.
 """
 
 import asyncio
+import logging
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -46,6 +47,49 @@ def _no_auto_discovery(monkeypatch):
 
 def _make_adapter() -> TelegramAdapter:
     return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+
+def test_transport_settings_defaults(monkeypatch):
+    adapter = _make_adapter()
+    for name in (
+        "HERMES_TELEGRAM_GET_UPDATES_TIMEOUT",
+        "HERMES_TELEGRAM_POLL_INTERVAL",
+        "HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT",
+        "HERMES_TELEGRAM_HTTP_READ_TIMEOUT",
+        "HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT",
+        "HERMES_TELEGRAM_HTTP_POOL_TIMEOUT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    request_kwargs, get_updates_timeout, poll_interval, adjusted = (
+        adapter._build_telegram_transport_settings()
+    )
+
+    assert request_kwargs["connect_timeout"] == 30.0
+    assert request_kwargs["read_timeout"] == 90.0
+    assert request_kwargs["write_timeout"] == 60.0
+    assert request_kwargs["pool_timeout"] == 15.0
+    assert get_updates_timeout == 50.0
+    assert poll_interval == 1.0
+    assert adjusted is False
+
+
+def test_transport_settings_clamp_read_timeout_above_get_updates(monkeypatch, caplog):
+    adapter = _make_adapter()
+    monkeypatch.setenv("HERMES_TELEGRAM_GET_UPDATES_TIMEOUT", "100")
+    monkeypatch.setenv("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", "30")
+
+    caplog.set_level(logging.WARNING)
+    request_kwargs, get_updates_timeout, _poll_interval, adjusted = (
+        adapter._build_telegram_transport_settings()
+    )
+
+    assert get_updates_timeout == 100.0
+    assert request_kwargs["read_timeout"] == 115.0
+    assert request_kwargs["read_timeout"] > get_updates_timeout
+    assert adjusted is True
+    assert "test-token" not in caplog.text
+    assert "read_timeout must exceed get_updates timeout" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -141,6 +185,40 @@ async def test_reconnect_success_resets_error_count():
     assert adapter._polling_network_error_count == 0
 
     # Clean up the heartbeat-probe task scheduled after a successful reconnect.
+    pending = [t for t in adapter._background_tasks if not t.done()]
+    for t in pending:
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_reconnect_start_polling_receives_explicit_timeout_values():
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 1
+    adapter._telegram_get_updates_timeout = 55.0
+    adapter._telegram_poll_interval = 2.5
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+    mock_updater.stop = AsyncMock()
+    mock_updater.start_polling = AsyncMock()
+
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    mock_app.bot.get_me = AsyncMock(return_value=MagicMock())
+    adapter._app = mock_app
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_network_error(Exception("Bad Gateway"))
+
+    kwargs = mock_updater.start_polling.await_args.kwargs
+    assert kwargs["timeout"] == 55.0
+    assert kwargs["poll_interval"] == 2.5
+    assert kwargs["drop_pending_updates"] is False
+
     pending = [t for t in adapter._background_tasks if not t.done()]
     for t in pending:
         t.cancel()
