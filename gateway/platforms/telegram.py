@@ -16,6 +16,7 @@ import os
 import tempfile
 import html as _html
 import re
+from importlib import metadata as _importlib_metadata
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -461,6 +462,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        self._telegram_get_updates_timeout: float = 50.0
+        self._telegram_poll_interval: float = 1.0
         # After sustained reconnect storms the PTB httpx pool can return
         # SendResult(success=True) for sends that never actually transmit.
         # _handle_polling_network_error sets this; _verify_polling_after_reconnect
@@ -812,6 +815,112 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(configured, str):
             configured = configured.split(",")
         return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
+
+    @staticmethod
+    def _env_int_clamped(
+        name: str,
+        default: int,
+        *,
+        min_value: Optional[int] = None,
+        max_value: Optional[int] = None,
+    ) -> int:
+        raw = os.getenv(name)
+        try:
+            value = int(raw) if raw is not None else int(default)
+        except (TypeError, ValueError):
+            value = int(default)
+        if min_value is not None:
+            value = max(value, min_value)
+        if max_value is not None:
+            value = min(value, max_value)
+        return value
+
+    def _build_telegram_transport_settings(self) -> tuple[Dict[str, Any], float, float, bool]:
+        """Return sanitized HTTPXRequest and polling settings.
+
+        The Bot API long-poll timeout must be shorter than the HTTP read
+        timeout. If operators set conflicting env values, clamp the effective
+        read timeout upward and warn without exposing any token/config secret.
+        """
+        get_updates_timeout = self._env_float_clamped(
+            "HERMES_TELEGRAM_GET_UPDATES_TIMEOUT",
+            50.0,
+            min_value=1.0,
+            max_value=300.0,
+        )
+        poll_interval = self._env_float_clamped(
+            "HERMES_TELEGRAM_POLL_INTERVAL",
+            1.0,
+            min_value=0.0,
+            max_value=30.0,
+        )
+        read_timeout = self._env_float_clamped(
+            "HERMES_TELEGRAM_HTTP_READ_TIMEOUT",
+            90.0,
+            min_value=5.0,
+            max_value=600.0,
+        )
+        adjusted_read_timeout = False
+        if read_timeout <= get_updates_timeout:
+            read_timeout = get_updates_timeout + 15.0
+            adjusted_read_timeout = True
+            logger.warning(
+                "[%s] Telegram read_timeout must exceed get_updates timeout; "
+                "using sanitized read_timeout=%.1fs for get_updates_timeout=%.1fs",
+                self.name,
+                read_timeout,
+                get_updates_timeout,
+            )
+
+        request_kwargs: Dict[str, Any] = {
+            "connection_pool_size": self._env_int_clamped(
+                "HERMES_TELEGRAM_HTTP_POOL_SIZE",
+                512,
+                min_value=1,
+                max_value=4096,
+            ),
+            "pool_timeout": self._env_float_clamped(
+                "HERMES_TELEGRAM_HTTP_POOL_TIMEOUT",
+                15.0,
+                min_value=1.0,
+                max_value=120.0,
+            ),
+            "connect_timeout": self._env_float_clamped(
+                "HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT",
+                30.0,
+                min_value=1.0,
+                max_value=300.0,
+            ),
+            "read_timeout": read_timeout,
+            "write_timeout": self._env_float_clamped(
+                "HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT",
+                60.0,
+                min_value=1.0,
+                max_value=300.0,
+            ),
+        }
+        return request_kwargs, get_updates_timeout, poll_interval, adjusted_read_timeout
+
+    def _telegram_start_polling_kwargs(
+        self,
+        *,
+        drop_pending_updates: bool,
+        error_callback: Any,
+    ) -> Dict[str, Any]:
+        return {
+            "allowed_updates": Update.ALL_TYPES,
+            "drop_pending_updates": drop_pending_updates,
+            "error_callback": error_callback,
+            "timeout": self._telegram_get_updates_timeout,
+            "poll_interval": self._telegram_poll_interval,
+        }
+
+    @staticmethod
+    def _package_version(package_name: str) -> str:
+        try:
+            return _importlib_metadata.version(package_name)
+        except Exception:
+            return "unknown"
 
     @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
@@ -1336,9 +1445,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
-        logger.warning(
-            "[%s] Telegram network error (attempt %d/%d), reconnecting in %ds. Error: %s",
-            self.name, attempt, MAX_NETWORK_RETRIES, delay, error,
+        log_fn = logger.info if attempt == 1 else logger.warning
+        log_fn(
+            "[%s] Telegram transient network reconnect (attempt %d/%d), reconnecting in %ds. Error: %s: %r",
+            self.name, attempt, MAX_NETWORK_RETRIES, delay, type(error).__name__, error,
         )
         await asyncio.sleep(delay)
 
@@ -1352,9 +1462,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             await self._app.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=False,
-                error_callback=self._polling_error_callback_ref,
+                **self._telegram_start_polling_kwargs(
+                    drop_pending_updates=False,
+                    error_callback=self._polling_error_callback_ref,
+                )
             )
             logger.info(
                 "[%s] Telegram polling resumed after network error (attempt %d)",
@@ -1479,9 +1590,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
             try:
                 await self._app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=False,
-                    error_callback=self._polling_error_callback_ref,
+                    **self._telegram_start_polling_kwargs(
+                        drop_pending_updates=False,
+                        error_callback=self._polling_error_callback_ref,
+                    )
                 )
                 logger.info(
                     "[%s] Telegram polling resumed after conflict retry %d/%d",
@@ -1902,29 +2014,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 builder = builder.local_mode(True)
                 logger.info("[%s] Using Telegram local_mode (read files from disk)", self.name)
 
-            # PTB defaults (pool_timeout=1s) are too aggressive on flaky networks and
-            # can trigger "Pool timeout: All connections in the connection pool are occupied"
-            # during reconnect/bootstrap. Use safer defaults and allow env overrides.
-            def _env_int(name: str, default: int) -> int:
-                try:
-                    return int(os.getenv(name, str(default)))
-                except (TypeError, ValueError):
-                    return default
-
-            def _env_float(name: str, default: float) -> float:
-                try:
-                    return float(os.getenv(name, str(default)))
-                except (TypeError, ValueError):
-                    return default
-
-            request_kwargs = {
-                "connection_pool_size": _env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
-                "pool_timeout": _env_float("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", 8.0),
-                "connect_timeout": _env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 10.0),
-                "read_timeout": _env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0),
-                "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
-            }
-
+            # PTB defaults are too aggressive on flaky long-poll networks.
+            # Use explicit, sanitized HTTP + getUpdates settings so the
+            # HTTP read timeout always exceeds Telegram's long-poll timeout.
+            (
+                request_kwargs,
+                self._telegram_get_updates_timeout,
+                self._telegram_poll_interval,
+                _adjusted_read_timeout,
+            ) = self._build_telegram_transport_settings()
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"})
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
@@ -1937,7 +2035,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
             proxy_targets = ["api.telegram.org", *fallback_ips]
             proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
+            fallback_mode = "disabled"
             if fallback_ips and not proxy_url and not disable_fallback:
+                fallback_mode = "enabled"
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",
                     self.name,
@@ -1954,6 +2054,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
                 )
             elif proxy_url:
+                fallback_mode = "proxy"
                 logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
                 request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
                 get_updates_request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
@@ -1962,6 +2063,23 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
                 request = HTTPXRequest(**request_kwargs)
                 get_updates_request = HTTPXRequest(**request_kwargs)
+
+            logger.warning(
+                "[%s] Telegram transport settings: connect_timeout=%.1fs "
+                "read_timeout=%.1fs write_timeout=%.1fs pool_timeout=%.1fs "
+                "get_updates_timeout=%.1fs poll_interval=%.1fs "
+                "fallback_ip_mode=%s python_telegram_bot=%s httpx=%s",
+                self.name,
+                float(request_kwargs["connect_timeout"]),
+                float(request_kwargs["read_timeout"]),
+                float(request_kwargs["write_timeout"]),
+                float(request_kwargs["pool_timeout"]),
+                self._telegram_get_updates_timeout,
+                self._telegram_poll_interval,
+                fallback_mode,
+                self._package_version("python-telegram-bot"),
+                self._package_version("httpx"),
+            )
 
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
@@ -2081,9 +2199,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_error_callback_ref = _polling_error_callback
 
                 await self._app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                    error_callback=_polling_error_callback,
+                    **self._telegram_start_polling_kwargs(
+                        drop_pending_updates=True,
+                        error_callback=_polling_error_callback,
+                    )
                 )
             
             # Register bot commands so Telegram shows a hint menu when users type /
