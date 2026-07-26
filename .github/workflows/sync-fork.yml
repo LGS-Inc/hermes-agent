@@ -1,0 +1,77 @@
+name: Sync Fork with Upstream
+
+# Keeps LGS-Inc/hermes-agent current with NousResearch/hermes-agent
+# so that "Update Hermes" on the bots actually pulls new code.
+#
+# Runs daily at 09:00 UTC (05:00 America/New_York during EDT).
+# Can also be triggered by hand from the Actions tab.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Merge upstream changes into main
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+
+          echo "Requesting upstream merge for ${REPO} (branch: main)..."
+
+          RESPONSE=$(gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${REPO}/merge-upstream" \
+            -f branch=main 2>&1)
+          STATUS=$?
+
+          echo "$RESPONSE"
+
+          if [ $STATUS -ne 0 ]; then
+            echo "::error::Upstream merge failed. See response above."
+            echo "This usually means the fork has diverged in a way that"
+            echo "cannot be merged automatically, and needs a manual review."
+            exit 1
+          fi
+
+          MERGE_TYPE=$(echo "$RESPONSE" | grep -o '"merge_type": *"[^"]*"' | head -1 | cut -d'"' -f4)
+          echo "merge_type=${MERGE_TYPE:-unknown}" >> "$GITHUB_OUTPUT"
+
+          case "${MERGE_TYPE}" in
+            fast-forward)
+              echo "::notice::Fork fast-forwarded to upstream. New code pulled."
+              ;;
+            merge)
+              echo "::notice::Upstream merged into fork. New code pulled."
+              ;;
+            none)
+              echo "::notice::Already current with upstream. Nothing to pull."
+              ;;
+            *)
+              echo "::notice::Sync completed. Merge type: ${MERGE_TYPE:-unreported}"
+              ;;
+          esac
+
+      - name: Report result
+        if: always()
+        run: |
+          echo "Sync job finished with merge type: ${{ steps.merge.outputs.merge_type }}"
+          echo "Bots can now run 'Update Hermes' and will receive current code."
