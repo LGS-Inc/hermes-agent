@@ -5,6 +5,12 @@ name: Sync Fork with Upstream
 #
 # Runs daily at 09:00 UTC (05:00 America/New_York during EDT).
 # Can also be triggered by hand from the Actions tab.
+#
+# NOTE: this uses WORKFLOW_TOKEN, not GITHUB_TOKEN.
+# GITHUB_TOKEN is denied the workflows scope by platform rule, so any
+# upstream change touching .github/workflows/ is rejected and the sync
+# fails. WORKFLOW_TOKEN must be a fine-grained PAT scoped to this repo
+# with Contents: read and write, and Workflows: read and write.
 
 on:
   schedule:
@@ -25,34 +31,57 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Verify sync token is present
+        env:
+          WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN }}
+        run: |
+          if [ -z "${WORKFLOW_TOKEN}" ]; then
+            echo "::error::WORKFLOW_TOKEN secret is not set."
+            echo "Create a fine-grained PAT scoped to this repository with"
+            echo "Contents: read and write, and Workflows: read and write,"
+            echo "then store it as the repository secret WORKFLOW_TOKEN."
+            exit 1
+          fi
+          echo "WORKFLOW_TOKEN is present."
+
       - name: Merge upstream changes into main
         id: merge
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.WORKFLOW_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
 
           echo "Requesting upstream merge for ${REPO} (branch: main)..."
 
-          RESPONSE=$(gh api \
-            --method POST \
+          HTTP_STATUS=$(curl -sS -o response.json -w '%{http_code}' \
+            -X POST \
             -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/repos/${REPO}/merge-upstream" \
-            -f branch=main 2>&1)
-          STATUS=$?
+            "https://api.github.com/repos/${REPO}/merge-upstream" \
+            -d '{"branch":"main"}')
 
-          echo "$RESPONSE"
+          echo "HTTP status: ${HTTP_STATUS}"
+          echo "Response body:"
+          cat response.json
+          echo ""
 
-          if [ $STATUS -ne 0 ]; then
-            echo "::error::Upstream merge failed. See response above."
-            echo "This usually means the fork has diverged in a way that"
-            echo "cannot be merged automatically, and needs a manual review."
+          if [ "${HTTP_STATUS}" -lt 200 ] || [ "${HTTP_STATUS}" -ge 300 ]; then
+            echo "::error::Upstream merge failed with HTTP ${HTTP_STATUS}."
+            if grep -q "workflows" response.json; then
+              echo "::error::Rejected on workflow-file permissions."
+              echo "WORKFLOW_TOKEN is missing the Workflows read and write"
+              echo "permission, or has expired. Fix the token, not the workflow."
+            fi
+            if [ "${HTTP_STATUS}" = "409" ]; then
+              echo "::error::Merge conflict between fork and upstream."
+              echo "This needs manual review. Do not force-push to resolve."
+            fi
             exit 1
           fi
 
-          MERGE_TYPE=$(echo "$RESPONSE" | grep -o '"merge_type": *"[^"]*"' | head -1 | cut -d'"' -f4)
+          MERGE_TYPE=$(grep -o '"merge_type"[[:space:]]*:[[:space:]]*"[^"]*"' response.json | head -1 | cut -d'"' -f4)
           echo "merge_type=${MERGE_TYPE:-unknown}" >> "$GITHUB_OUTPUT"
 
           case "${MERGE_TYPE}" in
@@ -74,4 +103,4 @@ jobs:
         if: always()
         run: |
           echo "Sync job finished with merge type: ${{ steps.merge.outputs.merge_type }}"
-          echo "Bots can now run 'Update Hermes' and will receive current code."
+          echo "Bots can now run 'Update Hermes' and will receive current code.".
