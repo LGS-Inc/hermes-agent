@@ -20401,6 +20401,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                                 _needs_compress = False
 
+                # ── Automatic context rollover (Defense 2) ──────────────
+                # Hard fresh-session rollover with battle handoff when
+                # compression can no longer safely maintain this chat
+                # (too many compaction generations, failed/ineffective
+                # compression, or a transcript grossly oversized for the
+                # active model — e.g. cloud→local model switch). Gated by
+                # context_rollover.enabled (default off) so fleet behavior
+                # is unchanged unless a profile opts in. On success the
+                # turn continues on the FRESH session with the handoff
+                # riding the sidecar notes; on any failure the old session
+                # is untouched and normal compression proceeds.
+                _rollover_entry = None
+                try:
+                    from gateway.context_rollover import (
+                        maybe_rollover_before_compression,
+                    )
+                    _rollover_entry = await maybe_rollover_before_compression(
+                        self,
+                        source=source,
+                        session_key=session_key,
+                        session_entry=session_entry,
+                        history=history,
+                        approx_tokens=_approx_tokens,
+                        context_length=_hyg_context_length,
+                        hygiene_threshold_pct=_hyg_threshold_pct,
+                        active_model=_hyg_model,
+                        sidecar_notes=turn_sidecar_notes,
+                    )
+                except Exception as _rollover_err:
+                    logger.warning(
+                        "Context rollover check failed (non-fatal): %s",
+                        _rollover_err,
+                    )
+                if _rollover_entry is not None:
+                    session_entry = _rollover_entry
+                    history = []
+                    _needs_compress = False
+
                 if _needs_compress:
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
