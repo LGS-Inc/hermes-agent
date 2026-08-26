@@ -91,6 +91,74 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.repetition_guard import is_repetition_dominated
+
+DUMBLEDORE_IMAGE_TOOL_REDIRECT = (
+    'Image generation runs through my image lane. Resend using /quality <prompt>, '
+    '/literal <prompt>, or /brand "EXACT TEXT" <scene>.'
+)
+# Explicit-command contract (identical to the gateway image dispatcher): only
+# a leading control prefix on the user's message — or the gateway-armed
+# control state — marks an image order. Keyword phrasing never does.
+_DUMBLEDORE_IMAGE_CONTROL_PREFIXES = ("/quality", "/literal", "/brand")
+# Terminal, shell, exec, and file-operation tools are never redirected, under
+# any phrasing: the image lane owns generation only, and local file work on
+# existing images (crop/resize/convert) must stay reachable.
+_DUMBLEDORE_NEVER_REDIRECT_TOOLS = frozenset({
+    "terminal",
+    "close_terminal",
+    "execute_code",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+})
+
+
+def _dumbledore_user_image_command(user_text: str) -> bool:
+    """True only when the user's message leads with an image control prefix."""
+    tokens = (user_text or "").lstrip().split()
+    return bool(tokens) and tokens[0].lower() in _DUMBLEDORE_IMAGE_CONTROL_PREFIXES
+
+
+def _dumbledore_agent_loop_image_redirect(agent, assistant_message, messages: list) -> Optional[str]:
+    """Redirect an EXPLICIT image command that leaked into the agent loop.
+
+    Fires only when the user's message leads with /quality, /literal, or
+    /brand, or the gateway set ``agent._dumbledore_image_control_armed``.
+    The model's reply text and tool arguments are never inspected, and
+    terminal/shell/exec/file-operation tool calls are never blocked.
+    """
+    if (
+        os.environ.get("DUMBLEDORE_ROUTER") != "1"
+        or os.environ.get("DUMBLEDORE_IMAGE_LANE") != "1"
+        or getattr(agent, "_dumbledore_answer_only_attachment", False)
+        or getattr(agent, "model", "") == "gemma4:12b"
+    ):
+        return None
+    calls = list(getattr(assistant_message, "tool_calls", None) or [])
+    if not calls:
+        return None
+    call_names = {
+        getattr(getattr(call, "function", None), "name", "") for call in calls
+    }
+    # A batch containing any exec/file tool passes through untouched —
+    # redirecting would kill the exec call alongside the rest.
+    if call_names & _DUMBLEDORE_NEVER_REDIRECT_TOOLS:
+        return None
+    # Reading an attached image is explicitly outside this guard.
+    if call_names == {"vision_analyze"}:
+        return None
+    user_text = ""
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            user_text = content if isinstance(content, str) else str(content or "")
+            break
+    if _dumbledore_user_image_command(user_text) or getattr(
+        agent, "_dumbledore_image_control_armed", False
+    ):
+        return DUMBLEDORE_IMAGE_TOOL_REDIRECT
+    return None
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
@@ -547,6 +615,11 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
+    # Rule 2 is explicitly single-shot and tool-free.  Keep this defensive
+    # exemption even though its agent normally has an empty tools list, so a
+    # future schema-refresh cannot silently reinstate the tool-only 64K guard.
+    if getattr(agent, "_dumbledore_answer_only_attachment", False):
+        return None
     if not getattr(agent, "tools", None):
         return None
 
@@ -909,6 +982,30 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "(session=%s): %s. Falling back to fresh build — prefix "
                 "cache will miss for this turn.",
                 agent.session_id, exc,
+            )
+
+    # Dumbledore's identity file is operational configuration. A gateway
+    # restart clears the in-process AIAgent cache, but continuing sessions can
+    # otherwise restore an older prompt snapshot from SQLite forever. Compare
+    # the authoritative SOUL prefix before accepting that persisted snapshot.
+    if stored_prompt and os.environ.get("DUMBLEDORE_ROUTER") == "1":
+        try:
+            import run_agent as _run_agent
+            current_soul = (_run_agent.load_soul_md() or "").strip()
+            if current_soul and not stored_prompt.startswith(current_soul):
+                logger.info(
+                    "Stored system prompt for session %s has stale SOUL.md "
+                    "content; rebuilding from the authoritative file.",
+                    agent.session_id,
+                )
+                stored_prompt = None
+                stored_state = "stale_soul"
+        except Exception:
+            logger.warning(
+                "Could not validate stored system prompt against SOUL.md; "
+                "retaining the persisted prompt for session %s.",
+                agent.session_id,
+                exc_info=True,
             )
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
@@ -7029,6 +7126,28 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                _image_tool_redirect = _dumbledore_agent_loop_image_redirect(
+                    agent, assistant_message, messages
+                )
+                if _image_tool_redirect:
+                    # Do not append the model's tool-call message: no tool was
+                    # invoked, so persisting it would create an orphaned call.
+                    messages.append({"role": "assistant", "content": _image_tool_redirect})
+                    agent._persist_session(messages, conversation_history)
+                    agent._safe_print(f"\n{_image_tool_redirect}\n")
+                    if agent.stream_delta_callback:
+                        try:
+                            agent.stream_delta_callback(_image_tool_redirect)
+                            agent.stream_delta_callback(None)
+                        except Exception:
+                            pass
+                    return {
+                        "final_response": _image_tool_redirect,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": True,
+                        "partial": False,
+                    }
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 

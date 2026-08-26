@@ -113,6 +113,39 @@ class TestStoredPromptReuse:
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
 
+    def test_dumbledore_stale_soul_rebuilds_after_gateway_restart(
+        self, monkeypatch, caplog
+    ):
+        """A continuing Dumbledore session must not restore old SOUL bytes."""
+        import run_agent
+
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": "# SOUL.md — Dumbledore\n\nOLD CONTENT"
+        }
+        agent = _make_agent(
+            session_db=db,
+            prebuilt_prompt="# SOUL.md — Dumbledore\n\nNEW CONTENT",
+        )
+        monkeypatch.setenv("DUMBLEDORE_ROUTER", "1")
+        monkeypatch.setattr(
+            run_agent,
+            "load_soul_md",
+            lambda *_a, **_kw: "# SOUL.md — Dumbledore\n\nNEW CONTENT",
+        )
+
+        with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt.endswith("NEW CONTENT")
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, agent._cached_system_prompt
+        )
+        assert any("stale SOUL.md" in r.getMessage() for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Legitimate fresh-build paths (no history, no DB)

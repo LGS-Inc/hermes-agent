@@ -613,6 +613,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    dumbledore_answer_only_attachment: bool = False,
 ):
     """
     Initialize the AI Agent.
@@ -949,6 +950,20 @@ def init_agent(
     agent.provider_require_parameters = provider_require_parameters
     agent.provider_data_collection = provider_data_collection
     agent.openrouter_min_coding_score = openrouter_min_coding_score
+
+    # Dumbledore Rule 2 is a gateway-routed, single-shot attachment answer.  It
+    # is intentionally tool-free, which makes Hermes' 64K tool-workflow floor
+    # inapplicable.  Treat the caller's marker as untrusted: all lane identity
+    # predicates must agree before it can affect tool loading or context guards.
+    agent._dumbledore_answer_only_attachment = bool(
+        dumbledore_answer_only_attachment
+        and os.environ.get("DUMBLEDORE_ROUTER") == "1"
+        and os.environ.get("DUMBLEDORE_IMAGE_LANE") == "1"
+        and agent.model == "gemma4:12b"
+    )
+    if agent._dumbledore_answer_only_attachment:
+        enabled_toolsets = []
+        disabled_toolsets = None
 
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
@@ -2838,7 +2853,18 @@ def init_agent(
         and not isinstance(agent._config_context_length, bool)
         and agent._config_context_length > 0
     )
-    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_lmstudio_explicit_below_floor:
+    # Dumbledore's attachment-reading lane is deliberately answer-only and uses
+    # gemma4 at its real 32K window.  The general 64K floor protects Hermes'
+    # tool-calling workflow, but rejecting this routed vision turn prevents the
+    # already-completed vision analysis from ever reaching the user.  Keep the
+    # exception feature-flagged and model-specific so ordinary agents and the
+    # outbound image-generation lane retain the global safety floor.
+    if (
+        _ctx
+        and _ctx < MINIMUM_CONTEXT_LENGTH
+        and not _allow_lmstudio_explicit_below_floor
+        and not agent._dumbledore_answer_only_attachment
+    ):
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "

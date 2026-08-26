@@ -1962,6 +1962,103 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
                         break
     return paths
 
+
+def _dumbledore_nonlocal_image_provenance(
+    messages: List[Dict[str, Any]], *, history_offset: int = 0
+) -> Optional[dict]:
+    """Return non-local provenance only when this turn produced the image.
+
+    If compression makes the caller's pre-turn boundary unverifiable, fail
+    closed: no label is safer than attributing an older paid render to a new
+    text-only turn.
+    """
+    if history_offset < 0 or len(messages or []) < history_offset:
+        return None
+    messages = (messages or [])[history_offset:]
+    calls: Dict[str, str] = {}
+    for msg in messages or []:
+        if msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or []:
+                call_id = call.get("id") or call.get("call_id")
+                fn = call.get("function") or {}
+                name = str(fn.get("name") or call.get("name") or "")
+                if call_id and name:
+                    calls[str(call_id)] = name
+    for msg in reversed(messages or []):
+        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+        if calls.get(call_id) != "image_generate":
+            continue
+        try:
+            payload = json.loads(str(msg.get("content") or ""))
+        except Exception:
+            continue
+        if not isinstance(payload, dict) or not payload.get("success"):
+            continue
+        size = str(payload.get("size") or payload.get("dimensions") or "")
+        match = re.search(r"(\d+)\s*[x×]\s*(\d+)", size, re.IGNORECASE)
+        width = int(match.group(1)) if match else None
+        height = int(match.group(2)) if match else None
+        path = next(
+            (payload.get(k) for k in _JSON_MEDIA_TOOL_PATH_FIELDS if payload.get(k)),
+            None,
+        )
+        if (width is None or height is None) and isinstance(path, str):
+            try:
+                from PIL import Image
+                with Image.open(path) as im:
+                    width, height = im.size
+            except Exception:
+                pass
+        return {
+            "provider": str(payload.get("provider") or "unknown"),
+            "model": str(payload.get("model") or "unknown"),
+            "width": width,
+            "height": height,
+            "path": path,
+        }
+    return None
+
+
+def _redact_historical_image_generate_evidence(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep transcript shape while withholding stale image provenance.
+
+    Historical tool-call/result pairs remain structurally valid for provider
+    APIs, but their provider/model/path payload and the immediately following
+    assistant report cannot be reused as evidence for the current request.
+    """
+    copied = [dict(msg) for msg in (messages or [])]
+    image_call_ids: set[str] = set()
+    redact_following_assistant = False
+    for msg in copied:
+        role = msg.get("role")
+        if role == "assistant":
+            calls = msg.get("tool_calls") or []
+            for call in calls:
+                fn = call.get("function") or {}
+                if str(fn.get("name") or call.get("name") or "") == "image_generate":
+                    cid = call.get("id") or call.get("call_id")
+                    if cid:
+                        image_call_ids.add(str(cid))
+            if redact_following_assistant and not calls:
+                msg["content"] = (
+                    "[Historical image response omitted: it is not provenance "
+                    "for the current turn.]"
+                )
+                redact_following_assistant = False
+        elif role in ("tool", "function"):
+            cid = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+            if cid in image_call_ids or msg.get("tool_name") == "image_generate":
+                msg["content"] = (
+                    "[Historical image_generate result omitted: prior-turn "
+                    "provider/model/path data is not current-turn evidence.]"
+                )
+                redact_following_assistant = True
+        elif role == "user":
+            redact_following_assistant = False
+    return copied
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -5392,6 +5489,18 @@ class TurnRunner:
 
         max_iterations = _current_max_iterations()
 
+        # Dumbledore router: stash this (MAIN interactive) turn's prompt +
+        # image flag so the home-mode hook can classify it. `has_image` is
+        # captured upstream in _handle_message (media is vision-enriched
+        # before this point). Default the route to non-local so a cloud pin
+        # never inherits a stale local-reply flag.
+        self._runner._dmbl_turn = {
+            "prompt": ctx.message or "",
+            "has_image": bool(getattr(self._runner, "_dmbl_pending_image", False)),
+        }
+        self._runner._dmbl_pending_image = False
+        self._runner._dmbl_last_route = {"local": False, "notice": ""}
+
         try:
             model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
                 source=ctx.source,
@@ -5517,6 +5626,39 @@ class TurnRunner:
 
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
+        # Start every turn from the platform-configured toolsets.  The
+        # attachment lane below narrows only its own effective values; it
+        # must not conditionally assign the outer names inside run_sync(),
+        # because that would make them uninitialized locals on normal turns.
+        _effective_enabled_toolsets = ctx.enabled_toolsets
+        _effective_disabled_toolsets = ctx.disabled_toolsets
+
+        # Dumbledore on GRYFFINDOR is local-only: remove the generic paid
+        # image path from his agent loop without changing the shared tool.
+        if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+            _effective_disabled_toolsets = list(
+                _effective_disabled_toolsets or []
+            )
+            if "image_gen" not in _effective_disabled_toolsets:
+                _effective_disabled_toolsets.append("image_gen")
+
+        # Rule 2: the home router selected gemma4 for this inbound image.
+        # Mark it explicitly as answer-only and remove every tool schema.
+        # Requiring both feature flags, the routed rule, model, and current
+        # attachment prevents /model gemma4 and non-image turns from sharing
+        # the sub-64K exemption.
+        _dmbl_route = getattr(self._runner, "_dmbl_last_route", None) or {}
+        _dmbl_answer_only_attachment = bool(
+            os.environ.get("DUMBLEDORE_ROUTER") == "1"
+            and os.environ.get("DUMBLEDORE_IMAGE_LANE") == "1"
+            and bool((getattr(self._runner, "_dmbl_turn", None) or {}).get("has_image"))
+            and _dmbl_route.get("rule") in ("image", "image_overflow_warn")
+            and turn_route["model"] == "gemma4:12b"
+        )
+        if _dmbl_answer_only_attachment:
+            _effective_enabled_toolsets = []
+            _effective_disabled_toolsets = None
+
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
         # .cursorrules) to cut AIAgent construction latency. Especially
@@ -5540,7 +5682,7 @@ class TurnRunner:
         _sig = self._runner._agent_config_signature(
             turn_route["model"],
             turn_route["runtime"],
-            ctx.enabled_toolsets,
+            _effective_enabled_toolsets,
             combined_ephemeral,
             cache_keys=self._runner._extract_cache_busting_config(ctx.user_config),
             user_id=getattr(ctx.source, "user_id", None),
@@ -5755,8 +5897,8 @@ class TurnRunner:
                 max_iterations=max_iterations,
                 quiet_mode=True,
                 verbose_logging=False,
-                enabled_toolsets=ctx.enabled_toolsets,
-                disabled_toolsets=ctx.disabled_toolsets,
+                enabled_toolsets=_effective_enabled_toolsets,
+                disabled_toolsets=_effective_disabled_toolsets,
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
@@ -5781,6 +5923,7 @@ class TurnRunner:
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
                 fallback_model=self._runner._refresh_fallback_model(),
+                dumbledore_answer_only_attachment=_dmbl_answer_only_attachment,
                 skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
@@ -8222,6 +8365,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     resolved_session_key
                 ).conversation.last_resolved_model = model
             self._session_state("*").conversation.last_resolved_model = model
+
+        # --- Dumbledore home-mode router (feature-flagged, fail-safe) ---------
+        # Inert unless env DUMBLEDORE_ROUTER=1. Authority for home-vs-pinned is
+        # router_mode.json (NOT the `override` flag): Hermes auto-persists the
+        # resolved model as a session model_override on every turn, so "override
+        # present" is true after turn 1 and cannot distinguish home from a real
+        # /model pin. router_mode is "home" by default (boot + the "home" control
+        # word) and "pinned" only when the Chairman runs /model — see
+        # _handle_message. In home mode the router overrides whatever was
+        # resolved (including the auto-persisted default). Reads the per-turn
+        # stash `self._dmbl_turn` (set for every inbound message in
+        # _handle_message; NOT consume-and-clear, so every resolve in the turn —
+        # main + any sub-turn — sees the same classification). ANY error falls
+        # back to the already-resolved (model, runtime_kwargs). Never selects an
+        # abliterated model (assert_not_abliterated).
+        _dmbl_home = False
+        if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+            try:
+                from agent import dumbledore_router as _dmbl_mode
+                _dmbl_home = _dmbl_mode.load_mode().get("mode", "home") == "home"
+            except Exception:
+                _dmbl_home = False
+        if _dmbl_home:
+            _turn = getattr(self, "_dmbl_turn", None)
+            if _turn:
+                try:
+                    from agent import dumbledore_router as _dmbl
+
+                    _dec = _dmbl.classify_home(
+                        _turn.get("prompt", ""),
+                        has_image=bool(_turn.get("has_image")),
+                    )
+                    _dmbl.assert_not_abliterated(_dec.model)
+                    _prov_runtime = _resolve_runtime_agent_kwargs_for_provider(
+                        _dec.provider
+                    )
+                    _prov_runtime.pop("model", None)
+                    model, runtime_kwargs = _dec.model, _prov_runtime
+                    # Record the route for the reply post-processor (refusal
+                    # suggestion is local-only; image-overflow notice is appended).
+                    self._dmbl_last_route = {
+                        "local": True,
+                        "model": _dec.model,
+                        "notice": _dec.notice,
+                        "rule": _dec.rule,
+                    }
+                    _dmbl.log_decision(
+                        mode="home",
+                        rule_fired=_dec.rule,
+                        model=_dec.model,
+                        est_prompt_tokens=_dec.est_prompt_tokens,
+                        outcome="routed",
+                    )
+                except Exception as _dmbl_exc:  # never break a turn
+                    logger.warning(
+                        "Dumbledore router skipped (fallback to %s): %s",
+                        model, _dmbl_exc,
+                    )
 
         return model, runtime_kwargs
 
@@ -12547,6 +12748,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._gateway_loop is not None:
             self._start_loop_liveness_guards(self._gateway_loop)
         logger.info("Session storage: %s", self.config.sessions_dir)
+
+        # Dumbledore router boot hook (flag-gated, fail-safe): force home mode
+        # and clear this gateway's stale persisted session pins so a /model pin
+        # can never survive a restart into home mode. Scoped by sessions_dir —
+        # never truncates gateway_routing. One-time state.db backup inside.
+        if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+            try:
+                from agent import dumbledore_router as _dmbl
+                _scope = str(getattr(self.config, "sessions_dir", "") or "")
+                _cleared = _dmbl.boot_home(scope=_scope) if _scope else _dmbl.boot_home()
+                logger.info("Dumbledore boot: home mode set; cleared %d stale pin(s)", _cleared)
+                _dmbl.log_decision(mode="home", rule_fired="boot", model="-",
+                                   est_prompt_tokens=0, outcome=f"cleared_pins={_cleared}")
+            except Exception as _dmbl_boot_exc:
+                logger.warning("Dumbledore boot hook skipped: %s", _dmbl_boot_exc)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
@@ -17461,6 +17677,522 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
 
+        # --- Dumbledore control words (flag-gated, fail-safe) ----------------
+        # Exact-match, case-insensitive, punctuation-stripped: "home",
+        # "uncut <prompt>", "uncut alt <prompt>", "/uncut <prompt>". Intercepted
+        # BEFORE normal command handling; "/model ..." is NOT matched here and
+        # passes through to its existing handler untouched. Any error falls
+        # through to normal handling (a message is never swallowed). Also stashes
+        # this event's image flag for the main-turn classifier.
+        if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+            try:
+                from agent import dumbledore_router as _dmbl
+
+                _dmbl_media = getattr(event, "media_urls", None) or []
+                _dmbl_mtypes = getattr(event, "media_types", None) or []
+                self._dmbl_pending_image = bool(_dmbl_media) and (
+                    (not _dmbl_mtypes)
+                    or any((t or "").startswith("image/") for t in _dmbl_mtypes)
+                )
+
+                # Stash this turn for the home-mode router — EVERY inbound
+                # message, so whichever resolve site fires sees it. NOT
+                # consume-and-clear (re-stashed fresh each message).
+                self._dmbl_turn = {
+                    "prompt": getattr(event, "text", "") or "",
+                    "has_image": self._dmbl_pending_image,
+                }
+                self._dmbl_last_route = {"local": False, "notice": ""}
+
+                # "/model <name>" pins a model -> leave home mode so the picker
+                # wins. "/model" alone or "/model --flag" (status) does not.
+                _dmbl_txt = (getattr(event, "text", "") or "").strip()
+                _dmbl_tok = _dmbl_txt.split()
+
+                # Dumbledore image controls are registered gateway commands,
+                # but consumed here before ordinary slash dispatch so they can
+                # also prefix an image prompt and compose in either order.
+                _dmbl_image_session = self._session_key_for_source(source)
+                _dmbl_quality_next = getattr(self, "_dmbl_quality_next", None)
+                if _dmbl_quality_next is None:
+                    _dmbl_quality_next = self._dmbl_quality_next = set()
+                _dmbl_literal_next = getattr(self, "_dmbl_literal_next", None)
+                if _dmbl_literal_next is None:
+                    _dmbl_literal_next = self._dmbl_literal_next = set()
+                _dmbl_brand_next = getattr(self, "_dmbl_brand_next", None)
+                if _dmbl_brand_next is None:
+                    _dmbl_brand_next = self._dmbl_brand_next = set()
+                _dmbl_image_controls = _dmbl.parse_image_controls(_dmbl_txt)
+                _dmbl_controls_on_this_message = bool(
+                    _dmbl_image_controls["consumed"]
+                    and _dmbl_image_controls["prompt"].strip()
+                )
+                if _dmbl_image_controls["consumed"]:
+                    if _dmbl_image_controls["quality"]:
+                        _dmbl_quality_next.add(_dmbl_image_session)
+                    if _dmbl_image_controls["literal"]:
+                        _dmbl_literal_next.add(_dmbl_image_session)
+                    if _dmbl_image_controls["brand"]:
+                        _dmbl_brand_next.add(_dmbl_image_session)
+                    _dmbl_remaining = _dmbl_image_controls["prompt"]
+                    if _dmbl_remaining:
+                        event.text = _dmbl_remaining
+                        _dmbl_txt = _dmbl_remaining
+                        _dmbl_tok = _dmbl_txt.split()
+                        self._dmbl_turn["prompt"] = _dmbl_remaining
+                    else:
+                        _armed = []
+                        if _dmbl_image_controls["quality"]:
+                            _armed.append("QUALITY (16 steps)")
+                        if _dmbl_image_controls["literal"]:
+                            _armed.append("LITERAL (no enrichment)")
+                        if _dmbl_image_controls["brand"]:
+                            _armed.append("PAID BRAND (BFL FLUX.2 Flex)")
+                        _control_reply = (
+                            "🎨 " + " + ".join(_armed)
+                            + " armed for the next image."
+                        )
+                        _img_adapter = self._adapter_for_source(source)
+                        try:
+                            _img_meta = self._thread_metadata_for_source(source, None)
+                        except Exception:
+                            _img_meta = None
+                        if _img_adapter:
+                            await _img_adapter.send(
+                                chat_id=source.chat_id,
+                                content=_control_reply,
+                                metadata=_img_meta,
+                            )
+                        return None
+
+                if (
+                    _dmbl_txt.lower().startswith("/model")
+                    and len(_dmbl_tok) >= 2
+                    and not _dmbl_tok[1].startswith("-")
+                ):
+                    _dmbl.save_mode("pinned")
+
+                _ctrl = _dmbl.parse_control(getattr(event, "text", "") or "")
+
+                # --- Image lane (Phase 2, flag: DUMBLEDORE_IMAGE_LANE=1) ------
+                # Turn classification for the VRAM lifecycle. Ordering contract:
+                # attachment ALWAYS wins (Rule 2 / img2img guard); only an
+                # EXPLICIT image command is an image turn.
+                #
+                # Explicit-command contract: a turn routes to the image lane
+                # ONLY via /quality, /literal, or /brand — either as a leading
+                # prefix on this message, or armed by a bare control on the
+                # immediately prior message. Keyword-shaped prose ("generate an
+                # image of…", "crop this image") is NOT an image order; it
+                # passes through to the agent loop untouched so local file-ops
+                # on existing images stay reachable.
+                _img_lane = os.environ.get("DUMBLEDORE_IMAGE_LANE") == "1"
+                _img_txt = getattr(event, "text", "") or ""
+                _img_control_intent = bool(
+                    _dmbl_controls_on_this_message
+                    or (
+                        _img_txt.strip()
+                        and (
+                            _dmbl_image_session in _dmbl_quality_next
+                            or _dmbl_image_session in _dmbl_literal_next
+                            or _dmbl_image_session in _dmbl_brand_next
+                        )
+                    )
+                )
+                _img_intent = (
+                    _img_lane and _ctrl.kind == "none" and _img_control_intent
+                )
+                _is_img_turn = _img_intent and not self._dmbl_pending_image
+                # MANDATORY pre-chat shutdown (Model B, warm-until-chat): on the
+                # FIRST non-image turn, release ComfyUI's 15.3GB BEFORE any chat
+                # model loads — otherwise the 8.6GB chat model spills to CPU.
+                # Ambiguity defaults to shutdown (_is_img_turn False → shutdown).
+                if _img_lane and not _is_img_turn and _dmbl.comfy_is_up():
+                    _ok = await self._run_in_executor_with_context(_dmbl.shutdown_comfy)
+                    _dmbl.log_decision(
+                        mode="home", rule_fired="image_lane_shutdown",
+                        model=_dmbl.IMAGE_GEN_MODEL, est_prompt_tokens=0,
+                        outcome=("pre_chat" if _ok else "pre_chat_FAILED"),
+                    )
+                    if not _ok:
+                        logger.error(
+                            "ComfyUI shutdown before chat-model load FAILED — "
+                            "VRAM may spill; investigate immediately"
+                        )
+
+                if _ctrl.kind != "none":
+                    _adapter = self._adapter_for_source(source)
+                    try:
+                        _meta = self._thread_metadata_for_source(source, None)
+                    except Exception:
+                        _meta = None
+
+                    if _ctrl.kind == "home":
+                        try:
+                            _sk = self._session_key_for_source(source)
+                        except Exception:
+                            _sk = None
+                        if _sk:
+                            self._session_model_overrides.pop(_sk, None)
+                            try:
+                                await self.async_session_store.set_model_override(_sk, None)
+                            except Exception:
+                                pass
+                        _dmbl.save_mode("home")
+                        _dmbl.log_decision(
+                            mode="home", rule_fired="control", model="-",
+                            est_prompt_tokens=0, outcome="home_ack",
+                        )
+                        if _adapter:
+                            await _adapter.send(
+                                chat_id=source.chat_id,
+                                content="🏠 Home mode — local auto-routing.",
+                                metadata=_meta,
+                            )
+                        return None
+
+                    if _ctrl.kind in ("uncut", "uncut_alt"):
+                        _alt = _ctrl.kind == "uncut_alt"
+                        _reply = await self._run_in_executor_with_context(
+                            lambda: _dmbl.run_uncut(_ctrl.payload, alt=_alt)
+                        )
+                        _dmbl.log_decision(
+                            mode="home", rule_fired="uncut",
+                            model=(_dmbl.UNCUT_MODEL_ALT if _alt else _dmbl.UNCUT_MODEL),
+                            est_prompt_tokens=_dmbl.estimate_tokens(_ctrl.payload),
+                            outcome="advisory",
+                        )
+                        if _adapter:
+                            await _adapter.send(
+                                chat_id=source.chat_id, content=_reply, metadata=_meta,
+                            )
+                        return None
+
+                # --- Image lane guards + HARD DISPATCH (Phase 2) --------------
+                # Guard: attachment + generative verb = img2img → out of scope.
+                # Clear refusal; never silently describe the image instead.
+                if _img_lane and _img_intent and self._dmbl_pending_image:
+                    _dmbl.log_decision(
+                        mode="home", rule_fired="img2img_refused",
+                        model=_dmbl.IMAGE_GEN_MODEL,
+                        est_prompt_tokens=_dmbl.estimate_tokens(_img_txt),
+                        outcome="refused",
+                    )
+                    _img_adapter = self._adapter_for_source(source)
+                    if _img_adapter:
+                        try:
+                            _img_meta = self._thread_metadata_for_source(source, None)
+                        except Exception:
+                            _img_meta = None
+                        await _img_adapter.send(
+                            chat_id=source.chat_id,
+                            content=_dmbl.IMG2IMG_REFUSAL,
+                            metadata=_img_meta,
+                        )
+                    return None
+
+                # HARD DISPATCH: generation order, no attachment, HOME mode.
+                # Same pattern as the code lane — bypass the agent loop
+                # entirely; never rely on the 9B choosing to call a tool.
+                if _is_img_turn and _dmbl.load_mode().get("mode", "home") == "home":
+                    _img_subject = _dmbl.extract_image_subject(_img_txt) or _img_txt.strip()
+                    _img_quality = _dmbl_image_session in _dmbl_quality_next
+                    _img_literal = _dmbl_image_session in _dmbl_literal_next
+                    _img_brand = _dmbl_image_session in _dmbl_brand_next
+                    _dmbl_quality_next.discard(_dmbl_image_session)
+                    _dmbl_literal_next.discard(_dmbl_image_session)
+                    _dmbl_brand_next.discard(_dmbl_image_session)
+                    _img_steps = (
+                        _dmbl.IMAGE_GEN_QUALITY_STEPS
+                        if _img_quality else _dmbl.IMAGE_GEN_STEPS
+                    )
+                    _img_width = (
+                        _dmbl.IMAGE_GEN_QUALITY_WIDTH
+                        if _img_quality else _dmbl.IMAGE_GEN_WIDTH
+                    )
+                    _img_height = (
+                        _dmbl.IMAGE_GEN_QUALITY_HEIGHT
+                        if _img_quality else _dmbl.IMAGE_GEN_HEIGHT
+                    )
+                    _img_preset = "quality" if _img_quality else "fast"
+                    _img_adapter = self._adapter_for_source(source)
+                    try:
+                        _img_meta = self._thread_metadata_for_source(source, None)
+                    except Exception:
+                        _img_meta = None
+                    # Paid text must be resolved before any render-start ack.
+                    # A malformed /brand request stays fail-closed and spends $0.
+                    _brand_request = _brand_subject = _brand_approved_text = None
+                    _img_prompt = None
+                    if _img_brand:
+                        try:
+                            _brand_request = _dmbl.parse_brand_dimensions(_img_subject)
+                            _brand_subject = _brand_request["prompt"]
+                            _brand_approved_text = _dmbl.extract_paid_brand_text(
+                                _brand_subject
+                            )
+                            _img_prompt = _dmbl.build_paid_brand_prompt(_brand_subject)
+                        except ValueError as exc:
+                            if _img_adapter:
+                                await _img_adapter.send(
+                                    chat_id=source.chat_id,
+                                    content=f"⚠️ /brand not started: {exc}",
+                                    metadata=_img_meta,
+                                )
+                            return None
+                    # Immediate ack — a cold run takes 60-90s.
+                    if _img_adapter:
+                        try:
+                            await _img_adapter.send(
+                                chat_id=source.chat_id,
+                                content=f"🎨 Generating: {_img_subject} — one moment…",
+                                metadata=_img_meta,
+                            )
+                        except Exception:
+                            pass
+                    _img_t0 = time.time()
+                    try:
+                        if _img_brand:
+                            if _img_adapter:
+                                await _img_adapter.send(
+                                    chat_id=source.chat_id,
+                                    content=(
+                                        "💳 Starting explicitly paid BFL brand render: "
+                                        f"{_brand_subject}"
+                                    ),
+                                    metadata=_img_meta,
+                                )
+                            _img_res = await self._run_in_executor_with_context(
+                                lambda: _dmbl.run_bfl_brand_generation(
+                                    _img_prompt,
+                                    width=_brand_request["width"],
+                                    height=_brand_request["height"],
+                                )
+                            )
+                            _spell = await self._run_in_executor_with_context(
+                                lambda: _dmbl.check_paid_brand_spelling(
+                                    _img_res["path"], _brand_approved_text
+                                )
+                            )
+                            _paid_caption = (
+                                "PAID RENDER — "
+                                f"{_img_res['provider']}/{_img_res['model']} — "
+                                f"{_img_res['width']}×{_img_res['height']} — "
+                                f"actual charged cost ${_img_res['cost_usd']:.2f} "
+                                f"({_img_res['cost_credits']:g} credits)."
+                            )
+                            if _spell["status"] == "mismatch":
+                                _paid_caption += (
+                                    " SPELLING CHECK: expected "
+                                    f"{_brand_approved_text!r}; Gemma read "
+                                    f"{_spell['observed_text']!r}. No automatic retry was made."
+                                )
+                            elif _spell["status"] == "inconclusive":
+                                _paid_caption += " Spelling check was inconclusive; image delivered without retry."
+                            elif _spell["status"] == "unavailable":
+                                _paid_caption += " Local Gemma spelling check was unavailable; image delivered without retry."
+                            _dmbl.log_decision(
+                                mode="home", rule_fired="brand_paid",
+                                model=_img_res["model"],
+                                provider=_img_res["provider"],
+                                width=_img_res["width"], height=_img_res["height"],
+                                swap=False, swap_seconds=time.time() - _img_t0,
+                                est_prompt_tokens=_dmbl.estimate_tokens(_img_subject),
+                                outcome="served_paid_api",
+                                original_prompt=_brand_subject,
+                                enriched_prompt=_img_prompt,
+                                preset=f"brand_paid:{_brand_request['preset']}",
+                                cost_estimate_usd=_img_res["cost_usd"],
+                                cost_actual_usd=_img_res["cost_usd"],
+                                cost_credits=_img_res["cost_credits"],
+                                text_mode="exact_quoted_brand",
+                                approved_text=_brand_approved_text,
+                                requested_width=_brand_request["width"],
+                                requested_height=_brand_request["height"],
+                                actual_width=_img_res["width"],
+                                actual_height=_img_res["height"],
+                                generation_count=1,
+                                spelling_status=_spell["status"],
+                                observed_text=_spell.get("observed_text") or None,
+                            )
+                            if _img_adapter:
+                                await _img_adapter.send_image_file(
+                                    chat_id=source.chat_id,
+                                    image_path=_img_res["path"],
+                                    caption=_paid_caption,
+                                    metadata=_img_meta,
+                                )
+                            return None
+                        # Enrich while the resident home model is available.
+                        # run_image_generation starts ComfyUI only afterward;
+                        # start_comfy's mandatory interlock unloads Ollama first.
+                        if _img_literal:
+                            _img_enrichment = {
+                                "prompt": _img_subject,
+                                "seconds": 0.0,
+                                "enriched": False,
+                                "reason": "literal",
+                            }
+                        else:
+                            _img_enrichment = await self._run_in_executor_with_context(
+                                lambda: _dmbl.enrich_image_prompt(_img_subject)
+                            )
+                        _img_prompt = _img_enrichment["prompt"]
+                        _img_res = await self._run_in_executor_with_context(
+                            lambda: _dmbl.run_image_generation(
+                                _img_prompt, steps=_img_steps,
+                                width=_img_width, height=_img_height,
+                            )
+                        )
+                        _dmbl.log_decision(
+                            mode="home", rule_fired="image_gen",
+                            model=_dmbl.IMAGE_GEN_MODEL,
+                            swap=_img_res["cold"],
+                            swap_seconds=time.time() - _img_t0,
+                            est_prompt_tokens=_dmbl.estimate_tokens(_img_subject),
+                            outcome="served",
+                            original_prompt=_img_subject,
+                            enriched_prompt=_img_prompt,
+                            enrichment_seconds=_img_enrichment["seconds"],
+                            preset=_img_preset,
+                            provider=_img_res["provider"],
+                            width=_img_res["width"],
+                            height=_img_res["height"],
+                        )
+                        if _img_adapter:
+                            await _img_adapter.send_image_file(
+                                chat_id=source.chat_id,
+                                image_path=_img_res["path"],
+                                caption=_img_subject,
+                                metadata=_img_meta,
+                            )
+                            _last_image_map = getattr(
+                                self, "_dmbl_last_delivered_image_provenance", None
+                            )
+                            if _last_image_map is None:
+                                _last_image_map = self._dmbl_last_delivered_image_provenance = {}
+                            _last_image_map[_dmbl_image_session] = {
+                                "scope": "local",
+                                "provider": _img_res["provider"],
+                                "model": _img_res["model"],
+                                "width": _img_res["width"],
+                                "height": _img_res["height"],
+                                "path": _img_res["path"],
+                            }
+                        # Warm-until-chat: leave ComfyUI up; arm the idle
+                        # backstop in case no further turn ever arrives.
+                        self._dmbl_comfy_last_used = time.time()
+                        _watch = getattr(self, "_dmbl_comfy_watchdog", None)
+                        if _watch is None or _watch.done():
+                            async def _dmbl_comfy_idle_loop():
+                                while True:
+                                    await asyncio.sleep(60)
+                                    if not _dmbl.comfy_is_up():
+                                        return
+                                    _idle = time.time() - getattr(
+                                        self, "_dmbl_comfy_last_used", 0
+                                    )
+                                    if _idle > _dmbl.COMFY_IDLE_TIMEOUT:
+                                        _ok = await self._run_in_executor_with_context(
+                                            _dmbl.shutdown_comfy
+                                        )
+                                        _dmbl.log_decision(
+                                            mode="home",
+                                            rule_fired="image_lane_shutdown",
+                                            model=_dmbl.IMAGE_GEN_MODEL,
+                                            est_prompt_tokens=0,
+                                            outcome=(
+                                                "idle_timeout" if _ok
+                                                else "idle_timeout_FAILED"
+                                            ),
+                                        )
+                                        return
+                            self._dmbl_comfy_watchdog = asyncio.create_task(
+                                _dmbl_comfy_idle_loop()
+                            )
+                        return None
+                    except Exception as _img_exc:
+                        _dmbl.log_decision(
+                            mode="home", rule_fired="image_gen",
+                            model=_dmbl.IMAGE_GEN_MODEL,
+                            swap=False, swap_seconds=time.time() - _img_t0,
+                            est_prompt_tokens=_dmbl.estimate_tokens(_img_subject),
+                            outcome=f"fallback:{type(_img_exc).__name__}",
+                        )
+                        logger.warning("Image generation failed: %s", _img_exc)
+                        if _img_adapter:
+                            await _img_adapter.send(
+                                chat_id=source.chat_id,
+                                content=(
+                                    (
+                                        "⚠️ Paid BFL brand render failed; no local "
+                                        "fallback was attempted. "
+                                    ) if _img_brand else "⚠️ Image generation failed "
+                                ) + f"({type(_img_exc).__name__}: {_img_exc}).",
+                                metadata=_img_meta,
+                            )
+                        return None
+
+                # --- Code-lane HARD DISPATCH (Chairman-authorized) -----------
+                # rule=code + build/edit guard: production asks (produce/
+                # refactor/debug/modify code) go DETERMINISTICALLY to the
+                # proven qwen-coder pipeline — no 9B discretion. Conversational
+                # code questions fail the guard and stay on the home default.
+                # HOME mode only (a /model pin wins); control words above win;
+                # image turns are gemma4's lane and never enter here.
+                if (
+                    _ctrl.kind == "none"
+                    and not self._dmbl_pending_image
+                    and _dmbl.load_mode().get("mode", "home") == "home"
+                    and _dmbl.is_code_production(getattr(event, "text", "") or "")
+                ):
+                    _code_prompt = getattr(event, "text", "") or ""
+                    _t0 = time.time()
+                    try:
+                        _coder_reply = await self._run_in_executor_with_context(
+                            lambda: _dmbl.run_coder_dispatch(_code_prompt)
+                        )
+                        _dur = time.time() - _t0
+                        _dmbl.log_decision(
+                            mode="home", rule_fired="code_dispatch",
+                            model=_dmbl.CODER_MODEL,
+                            swap=_dur > 15.0, swap_seconds=_dur,
+                            est_prompt_tokens=_dmbl.estimate_tokens(_code_prompt),
+                            outcome="served",
+                        )
+                        _adapter2 = self._adapter_for_source(source)
+                        if _adapter2:
+                            try:
+                                _meta2 = self._thread_metadata_for_source(source, None)
+                            except Exception:
+                                _meta2 = None
+                            await _adapter2.send(
+                                chat_id=source.chat_id,
+                                content=_coder_reply,
+                                metadata=_meta2,
+                            )
+                        return None
+                    except Exception as _coder_exc:
+                        # NEVER silent: flag the failure so the reply
+                        # post-processor prepends the notice, then fall
+                        # through to normal handling on the home default.
+                        _dur = time.time() - _t0
+                        self._dmbl_coder_failed = True
+                        _dmbl.log_decision(
+                            mode="home", rule_fired="code_dispatch",
+                            model=_dmbl.CODER_MODEL,
+                            swap=False, swap_seconds=_dur,
+                            est_prompt_tokens=_dmbl.estimate_tokens(_code_prompt),
+                            outcome=f"fallback:{type(_coder_exc).__name__}",
+                        )
+                        logger.warning(
+                            "Dumbledore code dispatch failed after %.1fs — "
+                            "falling back to home default WITH notice: %s",
+                            _dur, _coder_exc,
+                        )
+            except Exception as _dmbl_ctrl_exc:
+                logger.warning("Dumbledore control-word intercept skipped: %s", _dmbl_ctrl_exc)
+
         # Check for commands
         command = event.get_command()
 
@@ -20417,6 +21149,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+                history = _redact_historical_image_generate_evidence(history)
+                _last_image_map = getattr(
+                    self, "_dmbl_last_delivered_image_provenance", {}
+                )
+                _last_image = _last_image_map.get(session_key)
+                _provenance_note = (
+                    "No image has been delivered by the current text-only turn. "
+                    "Never use a prior-turn image tool result as provenance for "
+                    "this request."
+                )
+                if _last_image:
+                    _provenance_note += (
+                        " The most recent image actually delivered in this "
+                        f"session was {_last_image['scope'].upper()} via "
+                        f"{_last_image['provider']}/{_last_image['model']} at "
+                        f"{_last_image['width']}×{_last_image['height']}."
+                    )
+                context_prompt = (
+                    f"{context_prompt}\n\n[Verified image provenance]\n"
+                    f"{_provenance_note}"
+                ).strip()
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -20473,6 +21227,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+                _nonlocal_image = _dumbledore_nonlocal_image_provenance(
+                    agent_result.get("messages", []), history_offset=len(history)
+                )
+                if _nonlocal_image:
+                    _w = _nonlocal_image.get("width") or "unknown"
+                    _h = _nonlocal_image.get("height") or "unknown"
+                    _paid_label = (
+                        "NOT LOCAL  generated by "
+                        f"{_nonlocal_image['provider']}/{_nonlocal_image['model']} "
+                        f"at {_w}×{_h}. This was a paid API call, not your "
+                        "local FLUX pipeline."
+                    )
+                    response = f"{response}\n\n{_paid_label}" if response else _paid_label
+                    _last_image_map = getattr(
+                        self, "_dmbl_last_delivered_image_provenance", None
+                    )
+                    if _last_image_map is None:
+                        _last_image_map = self._dmbl_last_delivered_image_provenance = {}
+                    _last_image_map[session_key] = {
+                        "scope": "not local",
+                        **_nonlocal_image,
+                    }
+                    try:
+                        from agent import dumbledore_router as _dmbl
+                        _dmbl.log_decision(
+                            mode="home", rule_fired="image_gen_nonlocal",
+                            model=_nonlocal_image["model"],
+                            provider=_nonlocal_image["provider"],
+                            width=_nonlocal_image.get("width"),
+                            height=_nonlocal_image.get("height"),
+                            outcome="served_paid_api",
+                        )
+                    except Exception:
+                        logger.exception("Failed to log non-local image provenance")
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
@@ -20656,6 +21445,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
+
+            # Dumbledore router reply post-processor (flag-gated, fail-safe):
+            #  * append the image-overflow notice when set;
+            #  * on LOCAL-model turns only, append the refusal suggestion when
+            #    the reply matches a conservative refusal signature (SUGGEST-ONLY,
+            #    never reroutes; NO abliterated call is made here).
+            if os.environ.get("DUMBLEDORE_ROUTER") == "1" and response:
+                try:
+                    from agent import dumbledore_router as _dmbl
+                    _route = getattr(self, "_dmbl_last_route", None) or {}
+                    if getattr(self, "_dmbl_coder_failed", False):
+                        self._dmbl_coder_failed = False
+                        response = (
+                            "⚠️ Coder pipeline failed — answered locally by the "
+                            "home default.\n\n" + response
+                        )
+                    if _route.get("notice"):
+                        response = f"{response}\n\n{_route['notice']}"
+                    if _route.get("local"):
+                        response, _fired = _dmbl.maybe_append_refusal_suggestion(response)
+                        if _fired:
+                            _dmbl.log_decision(
+                                mode="home", rule_fired="refusal_suggest",
+                                model=_route.get("model", "-"),
+                                est_prompt_tokens=0, outcome="suggested",
+                            )
+                except Exception as _dmbl_reply_exc:
+                    logger.debug("Dumbledore reply post-processor skipped: %s", _dmbl_reply_exc)
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -22713,6 +23530,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             user_config = _load_gateway_config()
+            # Dumbledore router: stash this turn's prompt + image flag so the
+            # home-mode hook in _resolve_session_agent_runtime can classify it.
+            self._dmbl_turn = {
+                "prompt": prompt,
+                "has_image": any((t or "").startswith("image/") for t in media_types),
+            }
+            self._dmbl_last_route = {"local": False, "notice": ""}
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
@@ -22815,6 +23639,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     response,
                     result.get("messages", []),
                 )
+
+            # Dumbledore router reply post-processor (flag-gated, fail-safe) —
+            # same contract as the main path: image-overflow notice + local-only
+            # refusal suggestion (SUGGEST-ONLY, no abliterated call).
+            if os.environ.get("DUMBLEDORE_ROUTER") == "1" and response:
+                try:
+                    from agent import dumbledore_router as _dmbl
+                    _route = getattr(self, "_dmbl_last_route", None) or {}
+                    if getattr(self, "_dmbl_coder_failed", False):
+                        self._dmbl_coder_failed = False
+                        response = (
+                            "⚠️ Coder pipeline failed — answered locally by the "
+                            "home default.\n\n" + response
+                        )
+                    if _route.get("notice"):
+                        response = f"{response}\n\n{_route['notice']}"
+                    if _route.get("local"):
+                        response, _fired = _dmbl.maybe_append_refusal_suggestion(response)
+                        if _fired:
+                            _dmbl.log_decision(
+                                mode="home", rule_fired="refusal_suggest",
+                                model=_route.get("model", "-"),
+                                est_prompt_tokens=0, outcome="suggested",
+                            )
+                except Exception as _dmbl_reply_exc:
+                    logger.debug("Dumbledore bg reply post-processor skipped: %s", _dmbl_reply_exc)
 
             # Extract media files from the response
             if response:
