@@ -1,0 +1,146 @@
+name: Sync Fork with Upstream
+
+# Keeps LGS-Inc/hermes-agent current with NousResearch/hermes-agent
+# so that "Update Hermes" on the bots actually pulls new code.
+#
+# Runs daily at 09:00 UTC (05:00 America/New_York during EDT).
+# Can also be triggered by hand from the Actions tab.
+#
+# NOTE: this uses WORKFLOW_TOKEN, not GITHUB_TOKEN.
+# GITHUB_TOKEN is denied the workflows scope by platform rule, so any
+# upstream change touching .github/workflows/ is rejected and the sync
+# fails. WORKFLOW_TOKEN must be a fine-grained PAT scoped to this repo
+# with Contents: read and write, and Workflows: read and write.
+#
+# Repository invariant: main is upstream/main plus exactly one LGS commit
+# containing this workflow. Every run rebuilds that shape from upstream and
+# updates main with an explicit lease. It never merges and never uses an
+# unrestricted force push.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Rebuild main from upstream without merges
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Verify sync token is present
+        env:
+          WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN }}
+        run: |
+          if [ -z "${WORKFLOW_TOKEN}" ]; then
+            echo "::error::WORKFLOW_TOKEN secret is not set."
+            echo "Create a fine-grained PAT scoped to this repository with"
+            echo "Contents: read and write, and Workflows: read and write,"
+            echo "then store it as the repository secret WORKFLOW_TOKEN."
+            exit 1
+          fi
+          echo "WORKFLOW_TOKEN is present."
+
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.WORKFLOW_TOKEN }}
+
+      - name: Rebuild main from current upstream
+        id: sync
+        env:
+          WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_TOKEN }}
+          EXPECTED_RUN_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "LGS-Inc"
+          git config user.email "236669936+LGS-Inc@users.noreply.github.com"
+
+          git remote set-url origin "https://x-access-token:${WORKFLOW_TOKEN}@github.com/${REPOSITORY}.git"
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/NousResearch/hermes-agent.git"
+          else
+            git remote add upstream "https://github.com/NousResearch/hermes-agent.git"
+          fi
+
+          git fetch origin main
+          git fetch upstream main
+
+          EXPECTED_ORIGIN_MAIN=$(git rev-parse refs/remotes/origin/main)
+          UPSTREAM_MAIN=$(git rev-parse refs/remotes/upstream/main)
+
+          echo "expected_origin_main=${EXPECTED_ORIGIN_MAIN}"
+          echo "upstream_main=${UPSTREAM_MAIN}"
+
+          if [ "${EXPECTED_ORIGIN_MAIN}" != "${EXPECTED_RUN_SHA}" ]; then
+            echo "::error::origin/main moved after this workflow run started."
+            echo "Expected run SHA: ${EXPECTED_RUN_SHA}"
+            echo "Fetched origin/main: ${EXPECTED_ORIGIN_MAIN}"
+            exit 1
+          fi
+
+          CURRENT_PARENT=$(git rev-parse "${EXPECTED_ORIGIN_MAIN}^")
+          if git merge-base --is-ancestor "${CURRENT_PARENT}" "${UPSTREAM_MAIN}"; then
+            SYNC_PATH=fast-forward-upstream
+          else
+            SYNC_PATH=reset-after-upstream-rewrite
+          fi
+          echo "sync_path=${SYNC_PATH}" | tee -a "$GITHUB_OUTPUT"
+
+          WORKFLOW_COPY=$(mktemp)
+          cp .github/workflows/sync-fork.yml "${WORKFLOW_COPY}"
+
+          git checkout --detach "${UPSTREAM_MAIN}"
+          mkdir -p .github/workflows
+          cp "${WORKFLOW_COPY}" .github/workflows/sync-fork.yml
+          git add .github/workflows/sync-fork.yml
+
+          if git diff --cached --quiet; then
+            echo "::error::Upstream already contains the exact LGS workflow; refusing to create an empty LGS commit."
+            exit 1
+          fi
+
+          git commit -m "Keep fork sync workflow atop upstream"
+          CANDIDATE=$(git rev-parse HEAD)
+
+          if [ "$(git rev-parse HEAD^)" != "${UPSTREAM_MAIN}" ]; then
+            echo "::error::Candidate parent is not current upstream/main."
+            exit 1
+          fi
+          if [ "$(git rev-list --count "${UPSTREAM_MAIN}"..HEAD)" != "1" ]; then
+            echo "::error::Candidate is not exactly one commit ahead of upstream/main."
+            exit 1
+          fi
+          if [ "$(git diff-tree --no-commit-id --name-only -r HEAD)" != ".github/workflows/sync-fork.yml" ]; then
+            echo "::error::Candidate commit changes files beyond sync-fork.yml."
+            git diff-tree --no-commit-id --name-only -r HEAD
+            exit 1
+          fi
+          if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" != "2" ]; then
+            echo "::error::Candidate is a merge commit."
+            exit 1
+          fi
+
+          echo "candidate=${CANDIDATE}" | tee -a "$GITHUB_OUTPUT"
+          git push \
+            --force-with-lease="refs/heads/main:${EXPECTED_ORIGIN_MAIN}" \
+            origin \
+            "${CANDIDATE}:refs/heads/main"
+
+      - name: Report result
+        if: always()
+        run: |
+          echo "Sync path: ${{ steps.sync.outputs.sync_path }}"
+          echo "Candidate: ${{ steps.sync.outputs.candidate }}"
