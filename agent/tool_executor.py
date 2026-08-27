@@ -2162,9 +2162,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     action=next_args.get("action"),
                     target=target,
                     content=next_args.get("content"),
+                    new_text=next_args.get("new_text"),
                     old_text=next_args.get("old_text"),
                     operations=operations,
                     store=agent._memory_store,
+                    observability_context={
+                        "task_id": effective_task_id or "",
+                        "session_id": getattr(agent, "session_id", "") or "",
+                        "tool_call_id": tool_call_id or "",
+                        "turn_id": getattr(agent, "_current_turn_id", "") or "",
+                        "api_request_id": (
+                            getattr(agent, "_current_api_request_id", "") or ""
+                        ),
+                    },
                 )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager

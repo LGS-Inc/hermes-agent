@@ -400,6 +400,175 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
+_BUILTIN_MEMORY_MUTATION_ACTIONS = frozenset({"add", "replace", "remove"})
+_MEMORY_CORRELATION_FIELDS = (
+    "task_id",
+    "session_id",
+    "tool_call_id",
+    "turn_id",
+    "api_request_id",
+)
+
+
+def validate_builtin_memory_commit(
+    tool_result: Any,
+    tool_args: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return one normalized native-memory commit, or ``None`` fail-closed.
+
+    The built-in memory tool reports an exact partition of every requested
+    operation into ``applied_operation_indexes`` and
+    ``noop_operation_indexes``. This validator is the trust boundary shared by
+    the external-provider bridge and the plugin lifecycle signal. Missing,
+    malformed, duplicated, overlapping, incomplete, or self-contradictory
+    metadata is not evidence that a write committed, so observers receive
+    nothing.
+    """
+    if not isinstance(tool_args, dict):
+        return None
+    if isinstance(tool_result, str):
+        try:
+            tool_result = json.loads(tool_result)
+        except Exception:
+            return None
+    if not isinstance(tool_result, dict):
+        return None
+    if (
+        tool_result.get("success") is not True
+        or tool_result.get("staged") is True
+        or tool_result.get("error") not in (None, "")
+    ):
+        return None
+
+    noop = tool_result.get("noop")
+    if type(noop) is not bool:
+        return None
+
+    raw_operations = tool_args.get("operations")
+    if isinstance(raw_operations, list) and raw_operations:
+        action = "batch"
+        operations = raw_operations
+    else:
+        action = str(tool_args.get("action") or "")
+        operations = [{
+            "action": action,
+            "content": tool_args.get("content"),
+            "new_text": tool_args.get("new_text"),
+            "old_text": tool_args.get("old_text"),
+        }]
+
+    if not operations or not all(isinstance(op, dict) for op in operations):
+        return None
+    if any(
+        str(op.get("action") or "") not in _BUILTIN_MEMORY_MUTATION_ACTIONS
+        for op in operations
+    ):
+        return None
+
+    applied = tool_result.get("applied_operation_indexes")
+    noops = tool_result.get("noop_operation_indexes")
+    if not isinstance(applied, list) or not isinstance(noops, list):
+        return None
+
+    operation_count = len(operations)
+
+    def _valid_indexes(values: List[Any]) -> bool:
+        return (
+            all(type(index) is int and 0 <= index < operation_count for index in values)
+            and len(values) == len(set(values))
+        )
+
+    if not _valid_indexes(applied) or not _valid_indexes(noops):
+        return None
+    if set(applied) & set(noops):
+        return None
+    if set(applied) | set(noops) != set(range(operation_count)):
+        return None
+    if noop is not (not applied):
+        return None
+
+    return {
+        "action": action,
+        "target": str(tool_args.get("target") or "memory"),
+        "operations": operations,
+        "applied_operation_indexes": list(applied),
+        "noop_operation_indexes": list(noops),
+        "noop": noop,
+        "result": dict(tool_result),
+    }
+
+
+def emit_builtin_memory_lifecycle(
+    tool_result: Any,
+    tool_args: Dict[str, Any],
+    *,
+    observability_context: Optional[Dict[str, Any]] = None,
+    source: str = "memory_tool",
+    approval_id: str = "",
+) -> bool:
+    """Emit the authoritative post-commit plugin signal for native memory.
+
+    A signal is emitted only when the native result passes the exact commit
+    validator and the original request supplied every stable correlation ID.
+    Approved replay persists those IDs with the staged request and reuses its
+    pending-record ID as a deterministic replay/dedupe identity.
+    """
+    commit = validate_builtin_memory_commit(tool_result, tool_args)
+    if commit is None:
+        return False
+
+    context = dict(observability_context or {})
+    if not all(
+        isinstance(context.get(key), str) and context[key].strip()
+        for key in _MEMORY_CORRELATION_FIELDS
+    ):
+        return False
+
+    if source not in {"memory_tool", "approved_replay"}:
+        return False
+    approved_replay = source == "approved_replay"
+    if approved_replay:
+        if not isinstance(approval_id, str) or not approval_id:
+            return False
+        replay_id = f"memory-approval:{approval_id}"
+    else:
+        approval_id = ""
+        replay_id = ""
+
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+
+        if not has_hook("on_memory_lifecycle"):
+            return False
+        invoke_hook(
+            "on_memory_lifecycle",
+            mutation_event=True,
+            source=source,
+            approved_replay=approved_replay,
+            approval_id=approval_id,
+            replay_id=replay_id,
+            action=commit["action"],
+            target=commit["target"],
+            args=dict(tool_args),
+            result=commit["result"],
+            success=True,
+            mutation_applied=bool(commit["applied_operation_indexes"]),
+            noop=commit["noop"],
+            applied_operation_indexes=commit["applied_operation_indexes"],
+            noop_operation_indexes=commit["noop_operation_indexes"],
+            task_id=context["task_id"],
+            session_id=context["session_id"],
+            tool_call_id=context["tool_call_id"],
+            execution_id=context["tool_call_id"],
+            turn_id=context["turn_id"],
+            api_request_id=context["api_request_id"],
+        )
+        return True
+    except Exception:
+        logger.debug("on_memory_lifecycle hook failed", exc_info=True)
+        return False
+
+
 class MemoryManager:
     """Orchestrates the built-in provider plus at most one external provider.
 
@@ -1204,24 +1373,6 @@ class MemoryManager:
     # we ever reach a provider.
     _MIRRORED_MEMORY_ACTIONS = {"add", "replace", "remove"}
 
-    @staticmethod
-    def _memory_tool_result_succeeded(result: Any) -> bool:
-        """True only when the built-in memory tool actually committed a write.
-
-        Fails closed: a string that isn't JSON, a non-dict result, a missing
-        ``success``, or a write staged for approval (``staged is True``) all
-        return False so external providers are never told about a write that
-        did not land.
-        """
-        if isinstance(result, str):
-            try:
-                result = json.loads(result)
-            except Exception:
-                return False
-        if not isinstance(result, dict):
-            return False
-        return result.get("success") is True and result.get("staged") is not True
-
     def notify_memory_tool_write(
         self,
         tool_result: Any,
@@ -1238,6 +1389,7 @@ class MemoryManager:
 
         * gate on a committed (non-staged, successful) write,
         * expand the single-op and batched (``operations``) shapes,
+        * honor native no-op/applied-index commit metadata,
         * keep only mutating actions (add/replace/remove),
         * build per-op provenance metadata and forward ``old_text``.
 
@@ -1245,19 +1397,15 @@ class MemoryManager:
         session/task/tool-call provenance the manager does not) invoked once per
         mirrored op.
         """
-        if not self._memory_tool_result_succeeded(tool_result):
+        commit = validate_builtin_memory_commit(tool_result, tool_args)
+        if commit is None:
             return
 
-        target = str(tool_args.get("target") or "memory")
-        operations = tool_args.get("operations")
-        if isinstance(operations, list) and operations:
-            raw_operations = operations
-        else:
-            raw_operations = [{
-                "action": tool_args.get("action"),
-                "content": tool_args.get("content"),
-                "old_text": tool_args.get("old_text"),
-            }]
+        target = commit["target"]
+        raw_operations = [
+            commit["operations"][index]
+            for index in commit["applied_operation_indexes"]
+        ]
 
         for op in raw_operations:
             if not isinstance(op, dict):
@@ -1273,7 +1421,7 @@ class MemoryManager:
                 self.on_memory_write(
                     action,
                     target,
-                    str(op.get("content") or ""),
+                    str(op.get("content") or op.get("new_text") or ""),
                     metadata=metadata,
                 )
             except Exception as e:

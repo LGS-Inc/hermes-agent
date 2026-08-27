@@ -53,10 +53,19 @@ def _manager_with_provider():
     return mgr, provider
 
 
+def _single_commit(*, noop=False):
+    return {
+        "success": True,
+        "noop": noop,
+        "applied_operation_indexes": [] if noop else [0],
+        "noop_operation_indexes": [0] if noop else [],
+    }
+
+
 def test_notifies_remove_with_old_text_after_success():
     mgr, provider = _manager_with_provider()
     mgr.notify_memory_tool_write(
-        json.dumps({"success": True}),
+        json.dumps(_single_commit()),
         {"action": "remove", "target": "memory", "old_text": "stale preference entry"},
     )
     assert provider.calls == [
@@ -67,6 +76,150 @@ def test_notifies_remove_with_old_text_after_success():
             "metadata": {"old_text": "stale preference entry"},
         }
     ]
+
+
+def test_single_new_text_alias_is_mirrored():
+    mgr, provider = _manager_with_provider()
+    mgr.notify_memory_tool_write(
+        _single_commit(),
+        {"action": "add", "target": "memory", "new_text": "aliased fact"},
+    )
+
+    assert provider.calls == [
+        {
+            "action": "add",
+            "target": "memory",
+            "content": "aliased fact",
+            "metadata": {},
+        }
+    ]
+
+
+def test_partial_batch_mirrors_only_committed_operation_indexes():
+    mgr, provider = _manager_with_provider()
+    mgr.notify_memory_tool_write(
+        {
+            "success": True,
+            "noop": False,
+            "applied_operation_indexes": [1],
+            "noop_operation_indexes": [0],
+        },
+        {
+            "target": "memory",
+            "operations": [
+                {"action": "add", "content": "duplicate"},
+                {"action": "add", "new_text": "committed"},
+            ],
+        },
+    )
+
+    assert provider.calls == [
+        {
+            "action": "add",
+            "target": "memory",
+            "content": "committed",
+            "metadata": {},
+        }
+    ]
+
+
+def test_native_noop_result_is_not_mirrored():
+    mgr, provider = _manager_with_provider()
+    mgr.notify_memory_tool_write(
+        {
+            "success": True,
+            "noop": True,
+            "applied_operation_indexes": [],
+            "noop_operation_indexes": [0],
+        },
+        {
+            "target": "memory",
+            "operations": [{"action": "add", "content": "duplicate"}],
+        },
+    )
+
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"success": True, "noop": False},
+        {
+            "success": True,
+            "noop": False,
+            "applied_operation_indexes": [0],
+        },
+        {
+            "success": True,
+            "noop": False,
+            "applied_operation_indexes": [0, 0],
+            "noop_operation_indexes": [1],
+        },
+        {
+            "success": True,
+            "noop": False,
+            "applied_operation_indexes": [0],
+            "noop_operation_indexes": [1, 1],
+        },
+        {
+            "success": True,
+            "noop": False,
+            "applied_operation_indexes": [0],
+            "noop_operation_indexes": [0, 1],
+        },
+        {
+            "success": True,
+            "noop": False,
+            "applied_operation_indexes": [99],
+            "noop_operation_indexes": [0],
+        },
+        {
+            "success": True,
+            "noop": False,
+            "applied_operation_indexes": [True],
+            "noop_operation_indexes": [1],
+        },
+        {
+            "success": True,
+            "noop": False,
+            "applied_operation_indexes": [0],
+            "noop_operation_indexes": [],
+        },
+        {
+            "success": True,
+            "noop": True,
+            "applied_operation_indexes": [0],
+            "noop_operation_indexes": [1],
+        },
+        {
+            "success": True,
+            "noop": False,
+            "applied_operation_indexes": [],
+            "noop_operation_indexes": [0, 1],
+        },
+        {
+            "success": True,
+            "noop": "false",
+            "applied_operation_indexes": [0],
+            "noop_operation_indexes": [1],
+        },
+    ],
+)
+def test_malformed_native_commit_metadata_fails_closed(result):
+    mgr, provider = _manager_with_provider()
+    mgr.notify_memory_tool_write(
+        result,
+        {
+            "target": "memory",
+            "operations": [
+                {"action": "add", "content": "fact"},
+                {"action": "add", "content": "second"},
+            ],
+        },
+    )
+
+    assert provider.calls == []
 
 
 
@@ -90,7 +243,7 @@ def test_skips_unrecognized_tool_result_shape(tool_result):
 def test_build_metadata_callback_is_merged_per_op():
     mgr, provider = _manager_with_provider()
     mgr.notify_memory_tool_write(
-        json.dumps({"success": True}),
+        json.dumps(_single_commit()),
         {"action": "add", "target": "memory", "content": "fact"},
         build_metadata=lambda: {"session_id": "s1", "tool_name": "memory"},
     )

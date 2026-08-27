@@ -875,7 +875,10 @@ def _skill_not_found_error(name: str, suffix: str = "") -> str:
     return base
 
 
-def _validate_file_path(file_path: str) -> Optional[str]:
+def _validate_file_path(
+    file_path: str,
+    skill_name: Optional[str] = None,
+) -> Optional[str]:
     """
     Validate a file path for write_file/remove_file.
     Must be under an allowed subdirectory and not escape the skill dir.
@@ -885,11 +888,15 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     if not file_path:
         return "file_path is required."
 
-    normalized = Path(file_path)
+    # Normalize both platform spellings before allow-list checks. Runtime
+    # deployments are commonly Linux while callers may naturally submit a
+    # Windows-style path through a cross-platform client.
+    portable_path = file_path.replace("\\", "/")
+    normalized = Path(portable_path)
 
     # Prevent path traversal (checked before any allow-listing so the SKILL.md
     # exception below can never be reached by a traversal-laden path).
-    if has_traversal_component(file_path):
+    if has_traversal_component(file_path) or has_traversal_component(portable_path):
         return "Path traversal ('..') is not allowed."
 
     # SKILL.md is the canonical skill file and lives at the skill root, not
@@ -897,7 +904,13 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     # 'SKILL.md' and '<skill-name>/SKILL.md' — so callers can target the main
     # file. The traversal guard above still applies, so this can't escape.
     if normalized.parts and normalized.name == "SKILL.md":
-        if len(normalized.parts) == 1 or len(normalized.parts) == 2:
+        if len(normalized.parts) == 1:
+            return None
+        if (
+            len(normalized.parts) == 2
+            and skill_name
+            and normalized.parts[0] == skill_name
+        ):
             return None
 
     # Must be under an allowed subdirectory
@@ -910,6 +923,23 @@ def _validate_file_path(file_path: str) -> Optional[str]:
         return f"Provide a file path, not just a directory. Example: '{normalized.parts[0]}/myfile.md'"
 
     return None
+
+
+def _canonical_skill_file_path(
+    skill_name: str,
+    file_path: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return one portable relative spelling for every accepted skill path."""
+    error = _validate_file_path(file_path, skill_name)
+    if error:
+        return None, error
+    normalized = Path(file_path.replace("\\", "/"))
+    if normalized.name == "SKILL.md" and (
+        len(normalized.parts) == 1
+        or normalized.parts == (skill_name, "SKILL.md")
+    ):
+        return "SKILL.md", None
+    return normalized.as_posix(), None
 
 
 def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Path], Optional[str]]:
@@ -1131,9 +1161,10 @@ def _patch_skill(
 
     if file_path:
         # Patching a supporting file
-        err = _validate_file_path(file_path)
+        file_path, err = _canonical_skill_file_path(name, file_path)
         if err:
             return {"success": False, "error": err}
+        assert file_path is not None
         target, err = _resolve_skill_target(skill_dir, file_path)
         if err:
             return {"success": False, "error": err}
@@ -1330,9 +1361,10 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
 
 def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     """Add or overwrite a supporting file within any skill directory."""
-    err = _validate_file_path(file_path)
+    file_path, err = _canonical_skill_file_path(name, file_path)
     if err:
         return {"success": False, "error": err}
+    assert file_path is not None
 
     if not file_content and file_content != "":
         return {"success": False, "error": "file_content is required."}
@@ -1400,9 +1432,10 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
 
 def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     """Remove a supporting file from any skill directory."""
-    err = _validate_file_path(file_path)
+    file_path, err = _canonical_skill_file_path(name, file_path)
     if err:
         return {"success": False, "error": err}
+    assert file_path is not None
 
     existing = _find_skill(name)
     if not existing:
@@ -1519,6 +1552,9 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             new_string=payload.get("new_string"),
             replace_all=payload.get("replace_all", False),
             absorbed_into=payload.get("absorbed_into"),
+            task_id=payload.get("task_id"),
+            session_id=payload.get("session_id"),
+            execution_id=payload.get("execution_id"),
         )
     finally:
         _skill_gate_bypass.reset(token)
@@ -1530,6 +1566,140 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
 _sync_push_timer = None
 _sync_push_lock = None
 _SYNC_PUSH_DEBOUNCE_S = 5.0
+
+
+_SKILL_MUTATION_ACTIONS = frozenset({
+    "create",
+    "edit",
+    "patch",
+    "write_file",
+    "remove_file",
+    "delete",
+})
+
+
+def _skill_mutation_changed_file(
+    action: str,
+    name: str,
+    file_path: Optional[str],
+) -> str:
+    """Return the content-free relative target for a skill mutation event."""
+    if action == "delete":
+        return "."
+    if action in {"create", "edit"}:
+        return "SKILL.md"
+    if action == "patch":
+        if not file_path:
+            return "SKILL.md"
+    if file_path:
+        canonical, error = _canonical_skill_file_path(name, file_path)
+        if error is None and canonical:
+            return canonical
+    return ""
+
+
+def _skill_mutation_provenance(name: str) -> str:
+    """Best-effort local provenance without exporting any skill content."""
+    try:
+        from tools.skill_usage import load_usage, telemetry_provenance
+
+        record = load_usage().get(name)
+        return telemetry_provenance(name, record if isinstance(record, dict) else None)
+    except Exception:
+        return "unknown"
+
+
+def _skill_mutation_resulting_sha256(
+    action: str,
+    name: str,
+    file_path: Optional[str],
+) -> Optional[str]:
+    """Hash the resulting changed file without exposing its content or path."""
+    if action in {"remove_file", "delete"}:
+        return None
+    try:
+        import hashlib
+
+        existing = _find_skill(name)
+        if not existing:
+            return None
+        root = Path(existing["path"]).resolve()
+        relative = _skill_mutation_changed_file(action, name, file_path)
+        if not relative or relative == ".":
+            return None
+        target = (root / relative).resolve()
+        target.relative_to(root)
+        if not target.is_file():
+            return None
+        return hashlib.sha256(target.read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def _emit_skill_mutation_lifecycle(
+    action: str,
+    name: str,
+    *,
+    file_path: Optional[str],
+    task_id: Optional[str],
+    session_id: Optional[str],
+    provenance_hint: str,
+    result: Dict[str, Any],
+    execution_id: str,
+) -> None:
+    """Emit one distinct post-commit event for authoritative skill writes.
+
+    ``skill_usage`` already emits lifecycle telemetry for usage-state changes
+    such as ``created``/``patched``.  This event has the exact ``skill_manage``
+    action and ``mutation_event=True`` so mutation observers can consume it
+    without mistaking (or double-counting) the existing telemetry events.
+    """
+    if action not in _SKILL_MUTATION_ACTIONS:
+        return
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+
+        if not has_hook("on_skill_lifecycle"):
+            return
+        provenance = _skill_mutation_provenance(name)
+        if provenance == "unknown" and provenance_hint:
+            provenance = provenance_hint
+        changed_file = _skill_mutation_changed_file(action, name, file_path)
+        invoke_hook(
+            "on_skill_lifecycle",
+            action=action,
+            skill_name=name,
+            provenance=provenance,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            execution_id=execution_id,
+            use_count=None,
+            reused=None,
+            reuse_after_patch=None,
+            mutation_event=True,
+            changed_file=changed_file,
+            resulting_sha256=_skill_mutation_resulting_sha256(
+                action,
+                name,
+                file_path,
+            ),
+            success=True,
+            # Never forward content previews (``_change``), absolute paths, or
+            # arbitrary handler fields.  Mutation observers only need the
+            # concise terminal outcome alongside the correlation metadata.
+            result={
+                "success": True,
+                "message": str(result.get("message") or "")[:500],
+                "archived": bool(result.get("_archived")),
+            },
+        )
+    except Exception:
+        logger.debug(
+            "skill mutation lifecycle hook failed for %s/%s",
+            name,
+            action,
+            exc_info=True,
+        )
 
 
 def _maybe_debounced_sync_push(skill_name: str) -> None:
@@ -1587,12 +1757,28 @@ def skill_manage(
     absorbed_into: str = None,
     task_id: str = None,
     session_id: str = None,
+    execution_id: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
 
     Returns JSON string with results.
     """
+    if not execution_id:
+        # Registry-backed calls pass the original tool_call_id.  Direct/internal
+        # callers still get a collision-resistant stable ID which is persisted
+        # if approval staging delays the authoritative mutation.
+        import uuid
+
+        execution_id = uuid.uuid4().hex
+
+    if action in {"patch", "write_file", "remove_file"} and file_path:
+        canonical_file_path, path_error = _canonical_skill_file_path(name, file_path)
+        if path_error:
+            return tool_error(path_error, success=False)
+        assert canonical_file_path is not None
+        file_path = canonical_file_path
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
@@ -1606,6 +1792,8 @@ def skill_manage(
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
+        task_id=task_id, session_id=session_id,
+        execution_id=execution_id,
     )
     if gate_result is not None:
         return gate_result
@@ -1615,6 +1803,7 @@ def skill_manage(
     # JSONL ledger with before/after blobs. Telemetry, not a gate: failures
     # here must NEVER block the mutation (capture_before returns None on
     # error, and record_mutation below swallows everything).
+    _pre_mutation_provenance = _skill_mutation_provenance(name)
     _ledger_before = None
     _ledger_before_dir = None
     try:
@@ -1674,6 +1863,9 @@ def skill_manage(
                 _evidence["archived"] = bool(result.get("_archived"))
             if session_id:
                 _evidence["session_id"] = session_id
+            if task_id:
+                _evidence["task_id"] = task_id
+            _evidence["execution_id"] = execution_id
             if file_path:
                 _evidence["file_path"] = file_path
             _ledger.record_mutation(
@@ -1733,6 +1925,20 @@ def skill_manage(
             _maybe_debounced_sync_push(name)
         except Exception:
             pass
+
+        # Authoritative mutation event: one exact action and relative changed
+        # file after the write committed.  The distinct marker lets consumers
+        # ignore the older usage-state lifecycle events emitted above.
+        _emit_skill_mutation_lifecycle(
+            action,
+            name,
+            file_path=file_path,
+            task_id=task_id,
+            session_id=session_id,
+            provenance_hint=_pre_mutation_provenance,
+            result=result,
+            execution_id=execution_id,
+        )
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1879,6 +2085,7 @@ registry.register(
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into"),
         task_id=kw.get("task_id"),
-        session_id=kw.get("session_id")),
+        session_id=kw.get("session_id"),
+        execution_id=kw.get("tool_call_id")),
     emoji="📝",
 )

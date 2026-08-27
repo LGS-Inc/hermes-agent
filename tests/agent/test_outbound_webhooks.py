@@ -130,6 +130,7 @@ class TestParseConfig:
             )
         )
         assert len(targets) == 1
+        assert targets[0].events == ["on_session_end"]
         t = targets[0]
         assert t.url == "https://example.com/hook"
         assert t.events == ["on_session_end"]
@@ -159,7 +160,19 @@ class TestParseConfig:
             )
         )
         assert len(targets) == 1
-        assert targets[0].events == ["on_session_end"]
+
+    def test_memory_lifecycle_event_is_refused(self, caplog):
+        targets = outbound_webhooks.iter_configured_targets(
+            _cfg({
+                "url": "https://example.com/hook",
+                "events": ["on_memory_lifecycle"],
+            })
+        )
+        assert targets == []
+        assert any(
+            "restricted to trusted in-process plugins" in record.getMessage()
+            for record in caplog.records
+        )
 
     def test_all_unknown_events_skips_entry(self):
         assert outbound_webhooks.iter_configured_targets(

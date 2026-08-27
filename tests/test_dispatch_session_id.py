@@ -1,4 +1,4 @@
-"""Tests that handle_function_call forwards session_id into registry.dispatch."""
+"""Tests that handle_function_call forwards correlation into registry.dispatch."""
 
 import json
 from unittest.mock import MagicMock, patch
@@ -28,9 +28,15 @@ class TestSessionIdForwarding:
                 {"query": "test"},
                 task_id="t1",
                 session_id="sess-abc",
+                tool_call_id="call-abc",
+                turn_id="turn-abc",
+                api_request_id="request-abc",
                 skip_pre_tool_call_hook=True,
             )
         assert captured.get("session_id") == "sess-abc"
+        assert captured.get("tool_call_id") == "call-abc"
+        assert captured.get("turn_id") == "turn-abc"
+        assert captured.get("api_request_id") == "request-abc"
 
     def test_execute_code_path_forwards_session_id(self):
         """registry.dispatch receives session_id on the execute_code path."""
@@ -42,9 +48,15 @@ class TestSessionIdForwarding:
                 {"code": "print(1)"},
                 task_id="t1",
                 session_id="sess-xyz",
+                tool_call_id="call-xyz",
+                turn_id="turn-xyz",
+                api_request_id="request-xyz",
                 skip_pre_tool_call_hook=True,
             )
         assert captured.get("session_id") == "sess-xyz"
+        assert captured.get("tool_call_id") == "call-xyz"
+        assert captured.get("turn_id") == "turn-xyz"
+        assert captured.get("api_request_id") == "request-xyz"
 
     def test_session_id_default_is_none(self):
         """When session_id is omitted, dispatch receives None."""

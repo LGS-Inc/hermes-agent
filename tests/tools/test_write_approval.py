@@ -43,6 +43,18 @@ def test_default_gate_is_off(hermes_home):
     assert wa.write_approval_enabled("skills") is False
 
 
+def test_memory_lifecycle_is_trusted_plugin_only():
+    from hermes_cli.plugins import (
+        OUTBOUND_UNSUPPORTED_HOOKS,
+        SHELL_UNSUPPORTED_HOOKS,
+        VALID_HOOKS,
+    )
+
+    assert "on_memory_lifecycle" in VALID_HOOKS
+    assert "on_memory_lifecycle" in SHELL_UNSUPPORTED_HOOKS
+    assert "on_memory_lifecycle" in OUTBOUND_UNSUPPORTED_HOOKS
+
+
 def test_invalid_subsystem_is_off(hermes_home):
     from tools import write_approval as wa
     assert wa.write_approval_enabled("bogus") is False
@@ -175,6 +187,172 @@ def test_handle_approve_all(hermes_home):
     assert "Approved 2" in out
     assert wa.pending_count("memory") == 0
     assert len(store.user_entries) == 2
+
+
+def test_memory_approved_replay_emits_one_authoritative_mutation(
+    hermes_home,
+    monkeypatch,
+):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore, apply_memory_pending, memory_tool
+
+    events = []
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda hook_name, **payload: events.append((hook_name, payload)),
+    )
+    monkeypatch.setattr(wa, "_interactive_approval_available", lambda: False)
+    _set_approval("memory", True)
+
+    context = {
+        "task_id": "task-approved",
+        "session_id": "session-approved",
+        "tool_call_id": "call-approved",
+        "turn_id": "turn-approved",
+        "api_request_id": "request-approved",
+    }
+    store = MemoryStore()
+    store.load_from_disk()
+    staged = json.loads(memory_tool(
+        "add",
+        "user",
+        "approved preference",
+        store=store,
+        observability_context=context,
+    ))
+
+    assert staged["success"] is True
+    assert staged["staged"] is True
+    assert events == []
+    record = wa.get_pending(wa.MEMORY, staged["pending_id"])
+    assert record is not None
+    assert record["payload"]["observability_context"] == context
+
+    out = handle_pending_subcommand(
+        wa.MEMORY,
+        ["approve", record["id"]],
+        memory_store=store,
+    )
+    assert "Approved 1" in out
+    assert store.user_entries == ["approved preference"]
+
+    lifecycle = [
+        payload
+        for hook_name, payload in events
+        if hook_name == "on_memory_lifecycle"
+    ]
+    assert len(lifecycle) == 1
+    event = lifecycle[0]
+    assert event["mutation_event"] is True
+    assert event["source"] == "approved_replay"
+    assert event["approved_replay"] is True
+    assert event["approval_id"] == record["id"]
+    assert event["replay_id"] == f"memory-approval:{record['id']}"
+    assert event["action"] == "add"
+    assert event["target"] == "user"
+    assert event["success"] is True
+    assert event["mutation_applied"] is True
+    assert event["noop"] is False
+    assert event["applied_operation_indexes"] == [0]
+    assert event["noop_operation_indexes"] == []
+    assert event["execution_id"] == context["tool_call_id"]
+    for key, value in context.items():
+        assert event[key] == value
+
+    duplicate = apply_memory_pending(
+        record["payload"],
+        store,
+        approval_id=record["id"],
+    )
+    assert duplicate["success"] is True
+    assert duplicate["noop"] is True
+    assert store.user_entries == ["approved preference"]
+
+    lifecycle = [payload for hook_name, payload in events if hook_name == "on_memory_lifecycle"]
+    assert len(lifecycle) == 2
+    assert sum(event["mutation_applied"] is True for event in lifecycle) == 1
+    assert lifecycle[1]["mutation_applied"] is False
+    assert lifecycle[1]["noop"] is True
+    assert lifecycle[1]["replay_id"] == lifecycle[0]["replay_id"]
+    assert lifecycle[1]["execution_id"] == lifecycle[0]["execution_id"]
+
+
+def test_direct_batch_memory_lifecycle_uses_exact_contract(
+    hermes_home,
+    monkeypatch,
+):
+    from tools.memory_tool import MemoryStore, memory_tool
+
+    events = []
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda hook_name, **payload: events.append((hook_name, payload)),
+    )
+    context = {
+        "task_id": "task-direct",
+        "session_id": "session-direct",
+        "tool_call_id": "call-direct",
+        "turn_id": "turn-direct",
+        "api_request_id": "request-direct",
+    }
+    store = MemoryStore()
+    store.load_from_disk()
+    result = json.loads(memory_tool(
+        target="memory",
+        operations=[
+            {"action": "add", "content": "direct fact"},
+            {"action": "add", "content": "direct fact"},
+        ],
+        store=store,
+        observability_context=context,
+    ))
+    assert result["applied_operation_indexes"] == [0]
+    assert result["noop_operation_indexes"] == [1]
+
+    [event] = [payload for hook_name, payload in events if hook_name == "on_memory_lifecycle"]
+    assert event["action"] == "batch"
+    assert event["source"] == "memory_tool"
+    assert event["approved_replay"] is False
+    assert event["approval_id"] == ""
+    assert event["replay_id"] == ""
+    assert event["mutation_applied"] is True
+    assert event["applied_operation_indexes"] == [0]
+    assert event["noop_operation_indexes"] == [1]
+
+
+def test_memory_lifecycle_requires_every_stable_correlation_id(
+    hermes_home,
+    monkeypatch,
+):
+    from tools.memory_tool import MemoryStore, memory_tool
+
+    events = []
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda hook_name, **payload: events.append((hook_name, payload)),
+    )
+    store = MemoryStore()
+    store.load_from_disk()
+    result = json.loads(memory_tool(
+        "add",
+        "memory",
+        "native write remains available",
+        store=store,
+        observability_context={
+            "task_id": "task-incomplete",
+            "session_id": "session-incomplete",
+            "tool_call_id": "call-incomplete",
+            "turn_id": "turn-incomplete",
+            # api_request_id deliberately absent: lifecycle must fail closed.
+        },
+    ))
+    assert result["success"] is True
+    assert store.memory_entries == ["native write remains available"]
+    assert events == []
 
 
 def test_handle_approval_on(hermes_home):

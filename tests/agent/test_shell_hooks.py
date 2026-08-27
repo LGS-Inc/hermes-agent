@@ -298,14 +298,16 @@ class TestParseHooksBlock:
 
 
 
-    def test_python_only_event_refused(self, caplog):
+    @pytest.mark.parametrize(
+        "event",
+        ["transform_api_error_classification", "on_memory_lifecycle"],
+    )
+    def test_python_only_event_refused(self, event, caplog):
         # transform_api_error_classification returns a classification directive that
         # _parse_response has no channel for — a shell registration would
         # be silently ignored, so it must be refused with a warning.
         specs = shell_hooks._parse_hooks_block({
-            "transform_api_error_classification": [
-                {"command": "/tmp/hook.sh"},
-            ],
+            event: [{"command": "/tmp/hook.sh"}],
         })
         assert specs == []
         assert any("Python-plugin-only" in r.message for r in caplog.records)

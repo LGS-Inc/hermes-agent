@@ -221,6 +221,10 @@ VALID_HOOKS: Set[str] = {
     # Successful skill lifecycle facts. The local skill name is available to
     # plugins, while built-in shared metrics emit only bounded classifications.
     "on_skill_lifecycle",
+    # Authoritative built-in memory commit facts. This is intentionally an
+    # in-process plugin-only hook: payloads include the raw memory arguments,
+    # so config-driven shell/outbound transports must reject it.
+    "on_memory_lifecycle",
     "subagent_start",
     "subagent_stop",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
@@ -393,7 +397,15 @@ VALID_HOOKS: Set[str] = {
 # have its output silently ignored — registration is refused loudly instead.
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "on_memory_lifecycle",
     "transform_api_error_classification",
+}
+
+# Outbound HTTP hooks are also config-driven external transports. Memory
+# lifecycle payloads contain the user's raw durable-memory text and may only be
+# consumed by explicitly installed, in-process plugins.
+OUTBOUND_UNSUPPORTED_HOOKS: Set[str] = {
+    "on_memory_lifecycle",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

@@ -443,7 +443,11 @@ class MemoryStore:
 
             # Reject exact duplicates
             if content in entries:
-                return self._success_response(target, "Entry already exists (no duplicate added).")
+                return self._success_response(
+                    target,
+                    "Entry already exists (no duplicate added).",
+                    noop=True,
+                )
 
             # Calculate what the new total would be
             new_entries = entries + [content]
@@ -514,6 +518,15 @@ class MemoryStore:
                 # All identical -- safe to replace just the first
 
             idx = matches[0][0]
+            if entries[idx] == new_content:
+                return self._success_response(
+                    target,
+                    "Entry already has the requested content; no write was needed.",
+                    noop=True,
+                    applied_operation_indexes=[],
+                    noop_operation_indexes=[0],
+                )
+
             limit = self._char_limit(target)
 
             # Check that replacement doesn't blow the budget
@@ -602,8 +615,13 @@ class MemoryStore:
         # Scan every add/replace content for injection/exfil BEFORE touching
         # disk -- a single poisoned op rejects the whole batch.
         for i, op in enumerate(operations):
-            act = (op or {}).get("action")
-            new_content = (op or {}).get("content")
+            op = op or {}
+            act = op.get("action")
+            # Match execution semantics exactly: ``new_text`` is the documented
+            # compatibility alias when ``content`` is absent/empty.  Scanning
+            # only ``content`` let an aliased batch write bypass the strict
+            # prompt-injection/exfiltration scan.
+            new_content = op.get("content") or op.get("new_text")
             if act in {"add", "replace"} and new_content:
                 scan_error = _scan_memory_content(new_content)
                 if scan_error:
@@ -619,6 +637,8 @@ class MemoryStore:
             # Work on a copy; only commit if the whole batch validates.
             working: List[str] = list(self._entries_for(target))
             limit = self._char_limit(target)
+            applied_operation_indexes: List[int] = []
+            noop_operation_indexes: List[int] = []
 
             for i, op in enumerate(operations):
                 op = op or {}
@@ -631,8 +651,10 @@ class MemoryStore:
                     if not content:
                         return self._batch_error(target, f"{pos}: content is required.")
                     if content in working:
+                        noop_operation_indexes.append(i)
                         continue  # idempotent -- skip duplicate, don't fail the batch
                     working.append(content)
+                    applied_operation_indexes.append(i)
 
                 elif act == "replace":
                     if not old_text:
@@ -650,7 +672,12 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
-                    working[matches[0]] = content
+                    match_index = matches[0]
+                    if working[match_index] == content:
+                        noop_operation_indexes.append(i)
+                        continue
+                    working[match_index] = content
+                    applied_operation_indexes.append(i)
 
                 elif act == "remove":
                     if not old_text:
@@ -664,6 +691,7 @@ class MemoryStore:
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
                     working.pop(matches[0])
+                    applied_operation_indexes.append(i)
 
                 else:
                     return self._batch_error(
@@ -686,11 +714,24 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
-            # Commit.
-            self._set_entries(target, working)
-            self.save_to_disk(target)
+            # Commit only when at least one operation changed the authoritative
+            # store.  A duplicate-only/idempotent batch is successful, but it
+            # must not manufacture a disk write or downstream mirror event.
+            if applied_operation_indexes:
+                self._set_entries(target, working)
+                self.save_to_disk(target)
 
-        return self._success_response(target, f"Applied {len(operations)} operation(s).")
+        response = self._success_response(
+            target,
+            (
+                f"Applied {len(applied_operation_indexes)} of "
+                f"{len(operations)} operation(s)."
+            ),
+            noop=not applied_operation_indexes,
+            applied_operation_indexes=applied_operation_indexes,
+            noop_operation_indexes=noop_operation_indexes,
+        )
+        return response
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
@@ -723,7 +764,15 @@ class MemoryStore:
         """Truncated one-line previews of entries for error feedback."""
         return [e[:width] + ("..." if len(e) > width else "") for e in entries]
 
-    def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
+    def _success_response(
+        self,
+        target: str,
+        message: str = None,
+        *,
+        noop: bool = False,
+        applied_operation_indexes: Optional[List[int]] = None,
+        noop_operation_indexes: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
         # A successful write means the consolidation loop made progress, so the
         # per-turn failure budget resets (the cap counts consecutive failures,
         # not lifetime ones within a turn) (#42405).
@@ -746,6 +795,21 @@ class MemoryStore:
             "target": target,
             "usage": f"{pct}% — {current:,}/{limit:,} chars",
             "entry_count": len(entries),
+            "noop": noop,
+            # Single-operation calls use the same zero-based commit metadata
+            # as batches.  Batch callers pass their exact committed/no-op
+            # subsets; this default covers add/replace/remove, including the
+            # ``new_text`` compatibility alias.
+            "applied_operation_indexes": (
+                list(applied_operation_indexes)
+                if applied_operation_indexes is not None
+                else ([] if noop else [0])
+            ),
+            "noop_operation_indexes": (
+                list(noop_operation_indexes)
+                if noop_operation_indexes is not None
+                else ([0] if noop else [])
+            ),
         }
         if message:
             resp["message"] = message
@@ -946,8 +1010,35 @@ def load_on_disk_store() -> "MemoryStore":
     return store
 
 
-def _apply_write_gate(action: str, target: str, content: Optional[str],
-                      old_text: Optional[str]) -> Optional[str]:
+_MEMORY_OBSERVABILITY_FIELDS = (
+    "task_id",
+    "session_id",
+    "tool_call_id",
+    "turn_id",
+    "api_request_id",
+)
+
+
+def _normalize_memory_observability_context(
+    observability_context: Optional[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Keep only stable string correlation IDs persisted for approval replay."""
+    if not isinstance(observability_context, dict):
+        return {}
+    return {
+        key: value
+        for key in _MEMORY_OBSERVABILITY_FIELDS
+        if isinstance((value := observability_context.get(key)), str) and value
+    }
+
+
+def _apply_write_gate(
+    action: str,
+    target: str,
+    content: Optional[str],
+    old_text: Optional[str],
+    observability_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Evaluate the memory write gate. Returns a JSON tool-result string when
     the write should NOT proceed normally (blocked or staged), or None when the
     caller should perform the real write.
@@ -990,6 +1081,9 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         "target": target,
         "content": content,
         "old_text": old_text,
+        "observability_context": _normalize_memory_observability_context(
+            observability_context
+        ),
     }
     record = wa.stage_write(
         wa.MEMORY, payload,
@@ -1003,7 +1097,11 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     )
 
 
-def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
+def _apply_batch_write_gate(
+    target: str,
+    operations: List[Dict[str, Any]],
+    observability_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Evaluate the write gate for a batch of memory operations.
 
     Returns a JSON tool-result string when the batch should NOT proceed
@@ -1038,7 +1136,14 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     if decision.blocked:
         return tool_error(decision.message, success=False)
 
-    payload = {"action": "batch", "target": target, "operations": operations}
+    payload = {
+        "action": "batch",
+        "target": target,
+        "operations": operations,
+        "observability_context": _normalize_memory_observability_context(
+            observability_context
+        ),
+    }
     record = wa.stage_write(
         wa.MEMORY, payload,
         summary=f"{summary}: {detail[:120]}",
@@ -1091,6 +1196,8 @@ def memory_tool(
     new_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
     store: Optional[MemoryStore] = None,
+    *,
+    observability_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -1130,10 +1237,21 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        gate_result = _apply_batch_write_gate(target, operations)
+        gate_result = _apply_batch_write_gate(
+            target,
+            operations,
+            observability_context,
+        )
         if gate_result is not None:
             return gate_result
         result = store.apply_batch(target, operations)
+        from agent.memory_manager import emit_builtin_memory_lifecycle
+
+        emit_builtin_memory_lifecycle(
+            result,
+            {"action": "batch", "target": target, "operations": operations},
+            observability_context=observability_context,
+        )
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
@@ -1155,7 +1273,13 @@ def memory_tool(
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
-    gate_result = _apply_write_gate(action, target, content, old_text)
+    gate_result = _apply_write_gate(
+        action,
+        target,
+        content,
+        old_text,
+        observability_context,
+    )
     if gate_result is not None:
         return gate_result
 
@@ -1171,6 +1295,19 @@ def memory_tool(
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
 
+    from agent.memory_manager import emit_builtin_memory_lifecycle
+
+    emit_builtin_memory_lifecycle(
+        result,
+        {
+            "action": action,
+            "target": target,
+            "content": content,
+            "new_text": new_text,
+            "old_text": old_text,
+        },
+        observability_context=observability_context,
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1234,7 +1371,12 @@ def _memory_target_error(store: "MemoryStore", target: str) -> Optional[Dict[str
     }
 
 
-def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
+def apply_memory_pending(
+    payload: Dict[str, Any],
+    store: "MemoryStore",
+    *,
+    approval_id: str = "",
+) -> Dict[str, Any]:
     """Replay a staged memory write directly against the store, bypassing the
     write gate. Called by the /memory approve handler.
 
@@ -1248,14 +1390,49 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
-    if action == "add":
-        return store.add(target, content)
-    if action == "replace":
-        return store.replace(target, old_text, content)
-    if action == "remove":
-        return store.remove(target, old_text)
-    return {"success": False, "error": f"Unknown staged action '{action}'."}
+        tool_args = {
+            "action": "batch",
+            "target": target,
+            "operations": payload.get("operations") or [],
+        }
+        result = store.apply_batch(target, tool_args["operations"])
+    elif action == "add":
+        tool_args = {
+            "action": action,
+            "target": target,
+            "content": content,
+            "old_text": old_text,
+        }
+        result = store.add(target, content)
+    elif action == "replace":
+        tool_args = {
+            "action": action,
+            "target": target,
+            "content": content,
+            "old_text": old_text,
+        }
+        result = store.replace(target, old_text, content)
+    elif action == "remove":
+        tool_args = {
+            "action": action,
+            "target": target,
+            "content": content,
+            "old_text": old_text,
+        }
+        result = store.remove(target, old_text)
+    else:
+        return {"success": False, "error": f"Unknown staged action '{action}'."}
+
+    from agent.memory_manager import emit_builtin_memory_lifecycle
+
+    emit_builtin_memory_lifecycle(
+        result,
+        tool_args,
+        observability_context=payload.get("observability_context"),
+        source="approved_replay",
+        approval_id=approval_id,
+    )
+    return result
 # OpenAI Function-Calling Schema
 # =============================================================================
 
@@ -1383,12 +1560,16 @@ registry.register(
         old_text=args.get("old_text"),
         new_text=args.get("new_text"),
         operations=args.get("operations"),
-        store=kw.get("store")),
+        store=kw.get("store"),
+        observability_context={
+            "task_id": kw.get("task_id") or "",
+            "session_id": kw.get("session_id") or "",
+            "tool_call_id": kw.get("tool_call_id") or "",
+            "turn_id": kw.get("turn_id") or "",
+            "api_request_id": kw.get("api_request_id") or "",
+        },
+    ),
     check_fn=check_memory_requirements,
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides,
 )
-
-
-
-

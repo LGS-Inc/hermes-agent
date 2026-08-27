@@ -145,7 +145,11 @@ def _apply_one(subsystem: str, rec, memory_store):
             if memory_store is None:
                 return False, "memory store unavailable"
             from tools.memory_tool import apply_memory_pending
-            result = apply_memory_pending(payload, memory_store)
+            result = apply_memory_pending(
+                payload,
+                memory_store,
+                approval_id=str(rec.get("id") or ""),
+            )
             return bool(result.get("success")), result.get("error", "")
         else:
             from tools.skill_manager_tool import apply_skill_pending

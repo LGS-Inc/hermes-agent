@@ -266,7 +266,7 @@ def _parse_outbound_block(raw: Any) -> List[WebhookTarget]:
 
 
 def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
-    from hermes_cli.plugins import VALID_HOOKS
+    from hermes_cli.plugins import OUTBOUND_UNSUPPORTED_HOOKS, VALID_HOOKS
 
     if not isinstance(raw, dict):
         logger.warning(
@@ -301,7 +301,14 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
         return None
     events: List[str] = []
     for ev in events_raw:
-        if ev in VALID_HOOKS:
+        if ev in OUTBOUND_UNSUPPORTED_HOOKS:
+            logger.warning(
+                "hooks.outbound[%d]: event %r is restricted to trusted "
+                "in-process plugins and was ignored",
+                index,
+                ev,
+            )
+        elif ev in VALID_HOOKS:
             events.append(ev)
         else:
             logger.warning(
