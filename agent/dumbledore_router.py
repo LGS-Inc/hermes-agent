@@ -821,29 +821,81 @@ def _unload_ollama_models() -> None:
         pass
 
 
-def start_comfy(ready_timeout: float = 180.0) -> float:
-    """Start ComfyUI via the Phase-1 launcher (detached). Returns startup seconds.
+COMFY_UNIT = "comfyui.service"          # on-demand systemd --user unit (static, no [Install])
+COMFY_LAST_START_MECHANISM = "none"     # "systemd" | "launcher" | "already_up" (telemetry)
 
-    The launcher itself runs the Ollama unload interlock; we ALSO run it here
-    so the unload happens even when ComfyUI is already warm from a prior run.
+
+def _comfy_systemctl(*args: str, timeout: float = 30.0):
+    import subprocess
+    return subprocess.run(
+        ["systemctl", "--user", *args], capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def comfy_unit_available() -> bool:
+    """True when the on-demand comfyui.service user unit is loaded."""
+    try:
+        out = _comfy_systemctl("show", COMFY_UNIT, "-p", "LoadState", timeout=10)
+        return "LoadState=loaded" in (out.stdout or "")
+    except Exception:
+        return False
+
+
+def comfy_unit_state() -> str:
+    try:
+        out = _comfy_systemctl("is-active", COMFY_UNIT, timeout=10)
+        return (out.stdout or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def start_comfy(ready_timeout: float = 180.0) -> float:
+    """Start ComfyUI on demand. Returns startup seconds.
+
+    Prefers the bounded systemd user unit (``systemctl --user start comfyui``,
+    which runs the same launcher with its Ollama unload interlock); falls back
+    to the Phase-1 detached launcher when the unit is unavailable. We ALSO run
+    the unload interlock here so it happens even when ComfyUI is already warm.
     """
     import subprocess
 
+    global COMFY_LAST_START_MECHANISM
     _unload_ollama_models()
     if comfy_is_up():
+        COMFY_LAST_START_MECHANISM = "already_up"
         return 0.0
     t0 = time.time()
-    with open(COMFY_LAUNCH_LOG, "a") as log:
-        subprocess.Popen(
-            [COMFY_LAUNCHER],
-            stdout=log, stderr=log,
-            start_new_session=True,   # survive the caller; killed by shutdown_comfy
-        )
+    mechanism = "launcher"
+    if comfy_unit_available():
+        try:
+            if _comfy_systemctl("start", COMFY_UNIT, timeout=30).returncode == 0:
+                mechanism = "systemd"
+        except Exception:
+            mechanism = "launcher"
+    if mechanism == "launcher":
+        with open(COMFY_LAUNCH_LOG, "a") as log:
+            subprocess.Popen(
+                [COMFY_LAUNCHER],
+                stdout=log, stderr=log,
+                start_new_session=True,   # survive the caller; killed by shutdown_comfy
+            )
+    COMFY_LAST_START_MECHANISM = mechanism
     while time.time() - t0 < ready_timeout:
         if comfy_is_up():
             return time.time() - t0
+        if (
+            mechanism == "systemd"
+            and time.time() - t0 > 10
+            and comfy_unit_state() in ("failed", "inactive")
+        ):
+            break
         time.sleep(2)
-    raise RuntimeError(f"ComfyUI did not become ready within {ready_timeout:.0f}s")
+    if mechanism == "systemd":
+        try:
+            _comfy_systemctl("stop", COMFY_UNIT, timeout=40)
+        except Exception:
+            pass
+    raise RuntimeError(f"ComfyUI did not become ready within {ready_timeout:.0f}s ({mechanism})")
 
 
 def shutdown_comfy(wait: float = 25.0) -> bool:
@@ -856,6 +908,13 @@ def shutdown_comfy(wait: float = 25.0) -> bool:
     """
     import subprocess, signal as _signal
 
+    # Unit-managed instance: stop it through systemd first (bounded by the
+    # unit's TimeoutStopSec); the process-path below handles launcher runs.
+    try:
+        if comfy_unit_state() in ("active", "activating", "deactivating"):
+            _comfy_systemctl("stop", COMFY_UNIT, timeout=wait + 15)
+    except Exception:
+        pass
     if not comfy_is_up():
         return True
     try:

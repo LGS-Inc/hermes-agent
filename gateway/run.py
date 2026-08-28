@@ -8380,8 +8380,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # main + any sub-turn — sees the same classification). ANY error falls
         # back to the already-resolved (model, runtime_kwargs). Never selects an
         # abliterated model (assert_not_abliterated).
-        _dmbl_home = False
+        # --- Capability router (2026-08-27): apply this turn's decision -------
+        # `_dmbl_capability_dispatch` (in _handle_message) stashes a
+        # RouteDecision on self._dmbl_turn. Agent-loop routes (HOME_FAST,
+        # DEEP_LOCAL when the session fits, VISION, CLOUD_SAFE incl. fallback)
+        # override the resolved model here; "pin" decisions leave Hermes' own
+        # /model resolution untouched. ANY error falls back to the legacy
+        # home-mode classifier below, then to the already-resolved pair.
+        _dmbl_decision_applied = False
         if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+            _dmbl_turn_obj = None
+            if resolved_session_key:
+                _dmbl_turn_obj = (getattr(self, "_dmbl_turns", None) or {}).get(resolved_session_key)
+            if _dmbl_turn_obj is None:
+                _dmbl_turn_obj = getattr(self, "_dmbl_turn", None) or {}
+            _dec = _dmbl_turn_obj.get("decision")
+            if _dec is not None:
+                try:
+                    from agent import dumbledore_router as _dmbl
+                    from agent import dumbledore_capability_router as _dcap
+
+                    if _dec.dispatch == "agent" and _dec.provider:
+                        _dmbl.assert_not_abliterated(_dec.model)
+                        _prov_runtime = _resolve_runtime_agent_kwargs_for_provider(_dec.provider)
+                        _prov_runtime.pop("model", None)
+                        model, runtime_kwargs = _dec.model, _prov_runtime
+                        if _dec.route == _dcap.VISION:
+                            _rule = (
+                                "image_overflow_warn"
+                                if _dec.reason.reason_code.endswith("overflow_warn")
+                                else "image"
+                            )
+                        else:
+                            _rule = {
+                                _dcap.HOME_FAST: "default",
+                                _dcap.DEEP_LOCAL: "deep",
+                                _dcap.CLOUD_SAFE: "cloud_safe",
+                            }.get(_dec.route, _dec.route.lower())
+                        self._dmbl_last_route = {
+                            "local": _dec.model in _dcap.LOCAL_SPECIALIST_MODELS,
+                            "model": _dec.model,
+                            "notice": _dec.notice,
+                            "rule": _rule,
+                            "route": _dec.route,
+                        }
+                        _dmbl_decision_applied = True
+                    elif _dec.dispatch == "pin":
+                        self._dmbl_last_route = {
+                            "local": model in _dcap.LOCAL_SPECIALIST_MODELS,
+                            "model": model,
+                            "notice": _dec.notice,
+                            "rule": "pin",
+                            "route": _dec.route,
+                        }
+                        _dmbl_decision_applied = True
+                except Exception as _dmbl_exc:  # never break a turn
+                    logger.warning(
+                        "Dumbledore capability route skipped (fallback to %s): %s",
+                        model, _dmbl_exc,
+                    )
+
+        _dmbl_home = False
+        if not _dmbl_decision_applied and os.environ.get("DUMBLEDORE_ROUTER") == "1":
             try:
                 from agent import dumbledore_router as _dmbl_mode
                 _dmbl_home = _dmbl_mode.load_mode().get("mode", "home") == "home"
@@ -17703,11 +17763,93 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "has_image": self._dmbl_pending_image,
                 }
                 self._dmbl_last_route = {"local": False, "notice": ""}
+                # Capability router: the session-keyed stash is reset for EVERY
+                # inbound message so a decision from an earlier message (e.g. a
+                # cloud fallback) can never be applied to a later turn that
+                # bypasses the dispatch (slash command, control word, image).
+                try:
+                    _dmbl_turns0 = getattr(self, "_dmbl_turns", None)
+                    if _dmbl_turns0 is None:
+                        _dmbl_turns0 = self._dmbl_turns = {}
+                    _dmbl_turns0[self._session_key_for_source(source)] = self._dmbl_turn
+                except Exception:
+                    pass
 
                 # "/model <name>" pins a model -> leave home mode so the picker
                 # wins. "/model" alone or "/model --flag" (status) does not.
                 _dmbl_txt = (getattr(event, "text", "") or "").strip()
                 _dmbl_tok = _dmbl_txt.split()
+
+                # --- /route one-turn override (capability router, 2026-08-27) --
+                # Parsed BEFORE the image controls and before ordinary slash
+                # dispatch (same pattern as /quality). A bare "/route <verb>"
+                # arms the override for the next message; "/route <verb>
+                # <prompt>" applies it to this message; "/route status" is
+                # read-only; "/route auto" clears an armed override. Never
+                # touches the persistent /model pin.
+                from agent import dumbledore_capability_router as _dcap
+                _dmbl_route_next = getattr(self, "_dmbl_route_next", None)
+                if _dmbl_route_next is None:
+                    _dmbl_route_next = self._dmbl_route_next = {}
+                _dmbl_route_session = self._session_key_for_source(source)
+                _route_cmd = _dcap.parse_route_command(_dmbl_txt)
+                if _route_cmd is not None:
+                    _r_adapter = self._adapter_for_source(source)
+                    try:
+                        _r_meta = self._thread_metadata_for_source(source, None)
+                    except Exception:
+                        _r_meta = None
+
+                    async def _route_reply(_msg: str) -> None:
+                        if _r_adapter:
+                            await _r_adapter.send(
+                                chat_id=source.chat_id, content=_msg, metadata=_r_meta,
+                            )
+
+                    if _route_cmd.kind == "status":
+                        _pin_model, _ = self._dmbl_pin_info(_dmbl_route_session)
+                        _armed_now = _dmbl_route_next.get(_dmbl_route_session) or {}
+                        _status_txt = await self._run_in_executor_with_context(
+                            lambda: _dcap.route_status_text(
+                                mode=_dmbl.load_mode(),
+                                armed=_armed_now.get("route"),
+                                pinned_model=_pin_model,
+                            )
+                        )
+                        await _route_reply(_status_txt)
+                        return None
+                    if _route_cmd.kind == "auto":
+                        _dmbl_route_next.pop(_dmbl_route_session, None)
+                        await _route_reply("🧭 Route override cleared — automatic routing.")
+                        return None
+                    if _route_cmd.kind == "help" or _route_cmd.error:
+                        await _route_reply(
+                            (f"⚠️ {_route_cmd.error}\n\n" if _route_cmd.error else "")
+                            + _dcap.ROUTE_HELP
+                        )
+                        return None
+                    _armed = {"route": _route_cmd.route, "model": _route_cmd.model}
+                    if _route_cmd.prompt.strip():
+                        _dmbl_route_next[_dmbl_route_session] = _armed
+                        event.text = _route_cmd.prompt
+                        _dmbl_txt = _route_cmd.prompt
+                        _dmbl_tok = _dmbl_txt.split()
+                        self._dmbl_turn["prompt"] = _route_cmd.prompt
+                    else:
+                        _dmbl_route_next[_dmbl_route_session] = _armed
+                        _dcap.log_route_event(
+                            route=_route_cmd.route, reason_code="override_armed",
+                            model=_route_cmd.model or "-", outcome="armed",
+                        )
+                        await _route_reply(
+                            f"🧭 {_route_cmd.route} armed for your next message"
+                            + (f" ({_route_cmd.model})" if _route_cmd.model else "")
+                            + "."
+                        )
+                        return None
+                # Consume an armed override for THIS turn (one-turn semantics).
+                _route_armed = _dmbl_route_next.pop(_dmbl_route_session, None)
+                self._dmbl_turn["override"] = _route_armed
 
                 # Dumbledore image controls are registered gateway commands,
                 # but consumed here before ordinary slash dispatch so they can
@@ -17799,8 +17941,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     )
                 )
+                # Capability router (2026-08-27): a prose ORDER to generate a
+                # fresh image ("create/generate/render/draw an image of …")
+                # and the explicit "/route flux" override are image turns too.
+                # Attachments never generate (VISION or the img2img refusal);
+                # a non-image /route override suppresses prose detection.
+                _img_prose_intent = bool(
+                    _img_lane
+                    and _ctrl.kind == "none"
+                    and not _img_control_intent
+                    and not (
+                        _route_armed
+                        and _route_armed.get("route") != _dcap.IMAGE_GENERATION
+                    )
+                    and _dcap.is_image_generation_prose(
+                        _img_txt, has_image=self._dmbl_pending_image
+                    )
+                )
+                _img_route_override = bool(
+                    _img_lane
+                    and _ctrl.kind == "none"
+                    and _route_armed
+                    and _route_armed.get("route") == _dcap.IMAGE_GENERATION
+                )
                 _img_intent = (
-                    _img_lane and _ctrl.kind == "none" and _img_control_intent
+                    _img_lane
+                    and _ctrl.kind == "none"
+                    and (_img_control_intent or _img_prose_intent or _img_route_override)
                 )
                 _is_img_turn = _img_intent and not self._dmbl_pending_image
                 # MANDATORY pre-chat shutdown (Model B, warm-until-chat): on the
@@ -17808,7 +17975,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # model loads — otherwise the 8.6GB chat model spills to CPU.
                 # Ambiguity defaults to shutdown (_is_img_turn False → shutdown).
                 if _img_lane and not _is_img_turn and _dmbl.comfy_is_up():
-                    _ok = await self._run_in_executor_with_context(_dmbl.shutdown_comfy)
+                    _ok = await self._run_in_executor_with_context(_dcap.comfy_stop)
                     _dmbl.log_decision(
                         mode="home", rule_fired="image_lane_shutdown",
                         model=_dmbl.IMAGE_GEN_MODEL, est_prompt_tokens=0,
@@ -17894,7 +18061,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # HARD DISPATCH: generation order, no attachment, HOME mode.
                 # Same pattern as the code lane — bypass the agent loop
                 # entirely; never rely on the 9B choosing to call a tool.
-                if _is_img_turn and _dmbl.load_mode().get("mode", "home") == "home":
+                # IMAGE_GENERATION is a specialist capability: it overrides a
+                # persistent pin for this turn without rewriting the pin.
+                if _is_img_turn:
                     _img_subject = _dmbl.extract_image_subject(_img_txt) or _img_txt.strip()
                     _img_quality = _dmbl_image_session in _dmbl_quality_next
                     _img_literal = _dmbl_image_session in _dmbl_literal_next
@@ -18038,11 +18207,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 lambda: _dmbl.enrich_image_prompt(_img_subject)
                             )
                         _img_prompt = _img_enrichment["prompt"]
-                        _img_res = await self._run_in_executor_with_context(
-                            lambda: _dmbl.run_image_generation(
-                                _img_prompt, steps=_img_steps,
-                                width=_img_width, height=_img_height,
-                            )
+
+                        def _dmbl_flux_job():
+                            # Shared accelerator lock: unload every Ollama
+                            # resident, start ComfyUI on demand (systemd user
+                            # unit when available), queue the fixed reviewed
+                            # workflow, verify a non-empty PNG, copy under
+                            # /tmp/hermes-renders/. Lock released on return.
+                            with _dcap.AcceleratorLock().acquire(
+                                owner="gateway", route=_dcap.IMAGE_GENERATION,
+                                timeout=_dcap.LOCK_TIMEOUT_DEFAULT,
+                            ) as _lk:
+                                _pre = _dcap.prepare_for_flux()
+                                _out = _dcap.run_flux_generation(
+                                    _img_prompt, steps=_img_steps,
+                                    width=_img_width, height=_img_height,
+                                )
+                                _out["lock"] = _lk.result
+                                _out["previous_loaded"] = _pre["previous_loaded"]
+                                _out["unloaded"] = _pre["unloaded"]
+                                return _out
+
+                        _img_res = await self._run_in_executor_with_context(_dmbl_flux_job)
+                        _dcap.log_route_event(
+                            route=_dcap.IMAGE_GENERATION, reason_code=(
+                                "flux_route_override" if _img_route_override
+                                else "flux_prose" if _img_prose_intent
+                                else "flux_control"
+                            ),
+                            model=_dcap.IMAGE_GEN_LABEL, provider="comfyui",
+                            dispatch="image",
+                            previous_loaded=_img_res.get("previous_loaded"),
+                            unloaded=_img_res.get("unloaded"),
+                            lock=_img_res.get("lock"),
+                            load_seconds=_img_res.get("startup_seconds"),
+                            inference_seconds=_img_res.get("seconds"),
+                            comfy=_img_res.get("start_mechanism"),
+                            prompt_chars=len(_img_subject),
+                            outcome="ok",
                         )
                         _dmbl.log_decision(
                             mode="home", rule_fired="image_gen",
@@ -18092,9 +18294,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _idle = time.time() - getattr(
                                         self, "_dmbl_comfy_last_used", 0
                                     )
-                                    if _idle > _dmbl.COMFY_IDLE_TIMEOUT:
+                                    if _idle > _dcap.COMFY_IDLE_STOP_SECONDS:
                                         _ok = await self._run_in_executor_with_context(
-                                            _dmbl.shutdown_comfy
+                                            _dcap.comfy_stop
                                         )
                                         _dmbl.log_decision(
                                             mode="home",
@@ -18120,6 +18322,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             outcome=f"fallback:{type(_img_exc).__name__}",
                         )
                         logger.warning("Image generation failed: %s", _img_exc)
+                        _dcap.log_route_event(
+                            route=_dcap.IMAGE_GENERATION, reason_code="flux_failed",
+                            model=_dcap.IMAGE_GEN_LABEL, provider="comfyui",
+                            dispatch="image", outcome="fail",
+                            error=type(_img_exc).__name__,
+                        )
                         if _img_adapter:
                             await _img_adapter.send(
                                 chat_id=source.chat_id,
@@ -18133,63 +18341,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         return None
 
-                # --- Code-lane HARD DISPATCH (Chairman-authorized) -----------
-                # rule=code + build/edit guard: production asks (produce/
-                # refactor/debug/modify code) go DETERMINISTICALLY to the
-                # proven qwen-coder pipeline — no 9B discretion. Conversational
-                # code questions fail the guard and stay on the home default.
-                # HOME mode only (a /model pin wins); control words above win;
-                # image turns are gemma4's lane and never enter here.
-                if (
-                    _ctrl.kind == "none"
-                    and not self._dmbl_pending_image
-                    and _dmbl.load_mode().get("mode", "home") == "home"
-                    and _dmbl.is_code_production(getattr(event, "text", "") or "")
-                ):
-                    _code_prompt = getattr(event, "text", "") or ""
-                    _t0 = time.time()
-                    try:
-                        _coder_reply = await self._run_in_executor_with_context(
-                            lambda: _dmbl.run_coder_dispatch(_code_prompt)
-                        )
-                        _dur = time.time() - _t0
-                        _dmbl.log_decision(
-                            mode="home", rule_fired="code_dispatch",
-                            model=_dmbl.CODER_MODEL,
-                            swap=_dur > 15.0, swap_seconds=_dur,
-                            est_prompt_tokens=_dmbl.estimate_tokens(_code_prompt),
-                            outcome="served",
-                        )
-                        _adapter2 = self._adapter_for_source(source)
-                        if _adapter2:
-                            try:
-                                _meta2 = self._thread_metadata_for_source(source, None)
-                            except Exception:
-                                _meta2 = None
-                            await _adapter2.send(
-                                chat_id=source.chat_id,
-                                content=_coder_reply,
-                                metadata=_meta2,
-                            )
+                # --- Capability router dispatch (Chairman mission 2026-08-27) --
+                # Decides HOME_FAST / DEEP_LOCAL / CODE_FAST / CODE_HEAVY /
+                # VISION / CLOUD_SAFE / EXPLICIT_PIN for this turn, runs the
+                # resource preflight under the shared accelerator lock, and
+                # hard-dispatches the specialist lanes (code lanes, deep
+                # context-pack) — replacing the earlier home-only 14B code
+                # dispatch. Specialist capabilities override a persistent pin
+                # WITHOUT rewriting it. Control words above and image turns
+                # never enter here. Returns True when the reply was delivered.
+                _dmbl_is_slash = (getattr(event, "text", "") or "").lstrip().startswith("/")
+                if _ctrl.kind == "none" and not _is_img_turn and not _dmbl_is_slash:
+                    if await self._dmbl_capability_dispatch(event, source, _route_armed):
                         return None
-                    except Exception as _coder_exc:
-                        # NEVER silent: flag the failure so the reply
-                        # post-processor prepends the notice, then fall
-                        # through to normal handling on the home default.
-                        _dur = time.time() - _t0
-                        self._dmbl_coder_failed = True
-                        _dmbl.log_decision(
-                            mode="home", rule_fired="code_dispatch",
-                            model=_dmbl.CODER_MODEL,
-                            swap=False, swap_seconds=_dur,
-                            est_prompt_tokens=_dmbl.estimate_tokens(_code_prompt),
-                            outcome=f"fallback:{type(_coder_exc).__name__}",
-                        )
-                        logger.warning(
-                            "Dumbledore code dispatch failed after %.1fs — "
-                            "falling back to home default WITH notice: %s",
-                            _dur, _coder_exc,
-                        )
             except Exception as _dmbl_ctrl_exc:
                 logger.warning("Dumbledore control-word intercept skipped: %s", _dmbl_ctrl_exc)
 
@@ -21484,6 +21648,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
 
+            # Capability router post-turn (2026-08-27): keep-alive policy for
+            # the local model that served this turn, bounded telemetry, and the
+            # optional route signature (OFF unless DUMBLEDORE_ROUTE_SIGNATURE=1).
+            if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+                try:
+                    from agent import dumbledore_capability_router as _dcap
+                    _dec = (
+                        (getattr(self, "_dmbl_turns", None) or {}).get(session_key)
+                        or getattr(self, "_dmbl_turn", None) or {}
+                    ).get("decision")
+                    if _dec is not None:
+                        if (
+                            _dec.dispatch in ("agent", "pin")
+                            and _dec.model in _dcap.LOCAL_SPECIALIST_MODELS
+                            and _dec.keep_alive is not None
+                        ):
+                            await self._run_in_executor_with_context(
+                                lambda: _dcap.apply_keep_alive(_dec.model, _dec.keep_alive)
+                            )
+                        _dcap.log_route_event(
+                            route=_dec.route, reason_code=_dec.reason.reason_code,
+                            model=_dec.model, provider=_dec.provider,
+                            dispatch=_dec.dispatch, inference_seconds=_turn_seconds,
+                            keep_alive=_dec.keep_alive,
+                            outcome=("ok" if response else "empty"),
+                            prompt_sha8=_dec.reason.prompt_sha8,
+                        )
+                        if response:
+                            response = response + _dcap.route_signature(_dec)
+                except Exception as _dmbl_post_exc:
+                    logger.debug("Dumbledore capability post-turn skipped: %s", _dmbl_post_exc)
+
             # Dumbledore router reply post-processor (flag-gated, fail-safe):
             #  * append the image-overflow notice when set;
             #  * on LOCAL-model turns only, append the refusal suggestion when
@@ -21495,10 +21691,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _route = getattr(self, "_dmbl_last_route", None) or {}
                     if getattr(self, "_dmbl_coder_failed", False):
                         self._dmbl_coder_failed = False
-                        response = (
-                            "⚠️ Coder pipeline failed — answered locally by the "
-                            "home default.\n\n" + response
+                        _dmbl_fail_text = getattr(self, "_dmbl_coder_failed_text", None) or (
+                            "⚠️ Coder pipeline failed — answered locally by the home default."
                         )
+                        self._dmbl_coder_failed_text = None
+                        response = _dmbl_fail_text + "\n\n" + response
                     if _route.get("notice"):
                         response = f"{response}\n\n{_route['notice']}"
                     if _route.get("local"):
@@ -23575,6 +23772,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "has_image": any((t or "").startswith("image/") for t in media_types),
             }
             self._dmbl_last_route = {"local": False, "notice": ""}
+            # Background turns are never classified by the capability router:
+            # register a fresh (decision-less) turn under the session key so
+            # the resolver cannot inherit a stale decision from a main turn.
+            try:
+                _dmbl_turns_bg = getattr(self, "_dmbl_turns", None)
+                if _dmbl_turns_bg is None:
+                    _dmbl_turns_bg = self._dmbl_turns = {}
+                _dmbl_turns_bg[self._session_key_for_source(source)] = self._dmbl_turn
+            except Exception:
+                pass
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
@@ -23687,10 +23894,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _route = getattr(self, "_dmbl_last_route", None) or {}
                     if getattr(self, "_dmbl_coder_failed", False):
                         self._dmbl_coder_failed = False
-                        response = (
-                            "⚠️ Coder pipeline failed — answered locally by the "
-                            "home default.\n\n" + response
+                        _dmbl_fail_text = getattr(self, "_dmbl_coder_failed_text", None) or (
+                            "⚠️ Coder pipeline failed — answered locally by the home default."
                         )
+                        self._dmbl_coder_failed_text = None
+                        response = _dmbl_fail_text + "\n\n" + response
                     if _route.get("notice"):
                         response = f"{response}\n\n{_route['notice']}"
                     if _route.get("local"):
@@ -25622,6 +25830,410 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             func,
             *args,
         )
+
+    # ------------------------------------------------------------------
+    # Dumbledore capability router (Chairman mission 2026-08-27)
+    # ------------------------------------------------------------------
+
+    def _dmbl_pin_info(self, session_key: Optional[str]) -> tuple:
+        """(pinned_model, pinned_provider) for an explicit /model pin, else
+        (None, None). Read-only — never writes the override."""
+        if not session_key:
+            return None, None
+        try:
+            self._rehydrate_session_model_override(session_key)
+        except Exception:
+            pass
+        _override = None
+        try:
+            _state = self._peek_session_state(session_key)
+            _override = _state.conversation.model_override if _state else None
+        except Exception:
+            _override = None
+        if not _override:
+            try:
+                _override = self._session_model_overrides.get(session_key)
+            except Exception:
+                _override = None
+        if not _override or not isinstance(_override, dict):
+            return None, None
+        return _override.get("model"), _override.get("provider")
+
+    async def _dmbl_load_history(self, session_key: Optional[str]) -> tuple:
+        """Read-only view of the session transcript + rough token estimate.
+        Returns ([], None) when unknown. Never mutates the transcript."""
+        try:
+            if not session_key:
+                return [], None
+            _entry = await self.async_session_store.lookup_by_session_key(session_key)
+            if not _entry:
+                return [], 0
+            _hist = list(
+                await self.async_session_store.load_transcript(_entry.session_id) or []
+            )
+            from agent.model_metadata import estimate_messages_tokens_rough
+            return _hist, int(estimate_messages_tokens_rough(_hist))
+        except Exception:
+            return [], None
+
+    async def _dmbl_capability_dispatch(self, event, source, route_armed) -> bool:
+        """Capability-router turn entry (flag-gated by the caller, fail-safe).
+
+        Returns True when the turn was fully handled (a specialist reply was
+        delivered) and False when the ordinary agent path should continue
+        with the stashed decision. Any exception is swallowed by the caller's
+        intercept try/except — a message is never lost.
+        """
+        import hashlib as _hashlib
+
+        from agent import dumbledore_router as _dmbl
+        from agent import dumbledore_capability_router as _dcap
+
+        _text = getattr(event, "text", "") or ""
+        _has_image = bool(getattr(self, "_dmbl_pending_image", False))
+        _mode = _dmbl.load_mode().get("mode", "home")
+        try:
+            _sk = self._session_key_for_source(source)
+        except Exception:
+            _sk = None
+        _pin_model = _pin_provider = None
+        if _mode == "pinned":
+            _pin_model, _pin_provider = self._dmbl_pin_info(_sk)
+            if not _pin_model:
+                _mode = "home"
+        _override = (route_armed or {}).get("route")
+        _override_model = (route_armed or {}).get("model")
+        _decide = lambda _ht: _dcap.decide_route(
+            _text, has_image=_has_image, mode=_mode,
+            pinned_model=_pin_model, pinned_provider=_pin_provider,
+            override=_override, override_model=_override_model,
+            history_tokens=_ht,
+        )
+        # Decide first without touching the store; the transcript is read
+        # (read-only) only when a lane needs it: the DEEP_LOCAL fit check and
+        # the specialist context pack.
+        _decision = _decide(None)
+        _history, _history_tokens = [], None
+        if _decision.route == _dcap.DEEP_LOCAL or _decision.dispatch == "specialist":
+            _history, _history_tokens = await self._dmbl_load_history(_sk)
+            if _decision.route == _dcap.DEEP_LOCAL:
+                _decision = _decide(_history_tokens)
+        _turn = getattr(self, "_dmbl_turn", None)
+        if _turn is None:
+            _turn = self._dmbl_turn = {"prompt": _text, "has_image": _has_image}
+        _turn["decision"] = _decision
+        _turn["session_key"] = _sk
+        # Session-keyed stash: concurrent turns from other chats/topics must
+        # not read each other's decision (the resolver looks up by session key).
+        _turns = getattr(self, "_dmbl_turns", None)
+        if _turns is None:
+            _turns = self._dmbl_turns = {}
+        if _sk:
+            _turns[_sk] = _turn
+        _dcap.decision_telemetry(
+            _decision, mode=_mode, history_tokens=_history_tokens,
+            session_sha8=(_hashlib.sha256(_sk.encode()).hexdigest()[:8] if _sk else None),
+            pin_preserved=bool(_pin_model), outcome="decided",
+        )
+        if _decision.route == _dcap.IMAGE_GENERATION:
+            # Image orders are dispatched by the image lane above; reaching
+            # here means that lane is disabled — fall back to ordinary handling
+            # WITH a notice (never a silent drop).
+            _turn["decision"] = None
+            self._dmbl_coder_failed = True
+            self._dmbl_coder_failed_text = (
+                "⚠️ The local image lane is disabled (DUMBLEDORE_IMAGE_LANE off); "
+                "answered by the home model instead of rendering."
+            )
+            return False
+        if _decision.dispatch == "specialist":
+            return await self._dmbl_run_specialist_turn(
+                event, source, _decision, _history, _mode, _turn, _sk
+            )
+        if _decision.dispatch in ("agent", "pin"):
+            await self._dmbl_prepare_agent_route(_decision, _mode, _turn)
+        return False
+
+    async def _dmbl_prepare_agent_route(self, decision, mode: str, turn: dict) -> None:
+        """Resource preflight for an agent-loop local route: under the shared
+        accelerator lock, unload conflicting residents, stop ComfyUI, load the
+        target with the route's keep-alive. A LOAD failure -> CLOUD_SAFE for
+        this turn only (pin untouched) unless the request is local-only. Lock
+        contention: light routes (HOME_FAST / a light pin) simply proceed
+        locally without preflight — a busy lock is not a local failure — while
+        heavy targets fall back to CLOUD_SAFE."""
+        from agent import dumbledore_capability_router as _dcap
+
+        if decision.model not in _dcap.LOCAL_SPECIALIST_MODELS:
+            return
+        _heavy = decision.model in _dcap.HEAVY_LOCAL_MODELS
+        # Preload keep-alive: a positive duration is applied now; an
+        # intentional 0 (VISION / one-shot) is applied AFTER the turn by the
+        # post-turn hook, so the preload uses a short 5m window instead.
+        _keep = decision.keep_alive if decision.keep_alive else "5m"
+
+        def _prep():
+            with _dcap.AcceleratorLock().acquire(
+                owner="gateway", route=decision.route,
+                timeout=(_dcap.LOCK_TIMEOUT_DEFAULT if _heavy else _dcap.LOCK_TIMEOUT_LIGHT),
+            ) as _lk:
+                _res = _dcap.prepare_local_target(
+                    decision.model, route=decision.route, keep_alive=_keep,
+                    exclusive=(decision.model in _dcap.HEAVY_LOCAL_MODELS),
+                    stop_comfy=True,
+                )
+                _res["lock"] = _lk.result
+                return _res
+
+        try:
+            _res = await self._run_in_executor_with_context(_prep)
+            _dcap.log_route_event(
+                route=decision.route, reason_code=decision.reason.reason_code,
+                model=decision.model, provider=decision.provider,
+                dispatch=decision.dispatch,
+                previous_loaded=_res.get("previous_loaded"),
+                unloaded=_res.get("unloaded"), load_seconds=_res.get("load_seconds"),
+                lock=_res.get("lock"),
+                comfy=("stopped" if _res.get("comfy_stopped") else None),
+                outcome="prepared", prompt_sha8=decision.reason.prompt_sha8,
+                pin_preserved=(mode == "pinned"),
+            )
+        except _dcap.LockUnavailable as _exc:
+            if not _heavy:
+                # Busy accelerator, healthy local model: proceed locally
+                # without preflight (Ollama loads lazily); never the cloud.
+                _dcap.log_route_event(
+                    route=decision.route, reason_code=decision.reason.reason_code,
+                    model=decision.model, provider=decision.provider,
+                    dispatch=decision.dispatch, lock="timeout",
+                    outcome="proceed_local_without_preflight",
+                    prompt_sha8=decision.reason.prompt_sha8,
+                )
+                return
+            _code = type(_exc).__name__
+            logger.warning(
+                "Dumbledore %s preflight failed (%s): %s", decision.route, _code, _exc,
+            )
+            try:
+                _fb = _dcap.cloud_fallback_decision(decision, _code)
+            except _dcap.LocalOnlyViolation:
+                turn["decision"] = None
+                self._dmbl_coder_failed = True
+                self._dmbl_coder_failed_text = (
+                    f"⚠️ Local-only execution was required but {decision.model} could "
+                    f"not be prepared ({_code}); no cloud fallback was used."
+                )
+                _dcap.log_route_event(
+                    route=decision.route, reason_code=decision.reason.reason_code,
+                    model=decision.model, outcome="fail_local_only", error=_code,
+                    prompt_sha8=decision.reason.prompt_sha8,
+                )
+                return
+            turn["decision"] = _fb
+            _dcap.log_route_event(
+                route=_fb.route, reason_code=_fb.reason.reason_code, model=_fb.model,
+                provider=_fb.provider, dispatch="agent", fallback=decision.route,
+                error=_code, outcome="fallback_cloud",
+                prompt_sha8=decision.reason.prompt_sha8, pin_preserved=(mode == "pinned"),
+            )
+        except _dcap.LocalLoadError as _exc:
+            _code = type(_exc).__name__
+            logger.warning(
+                "Dumbledore %s preflight failed (%s): %s", decision.route, _code, _exc,
+            )
+            try:
+                _fb = _dcap.cloud_fallback_decision(decision, _code)
+            except _dcap.LocalOnlyViolation:
+                turn["decision"] = None
+                self._dmbl_coder_failed = True
+                self._dmbl_coder_failed_text = (
+                    f"⚠️ Local-only execution was required but {decision.model} could "
+                    f"not be prepared ({_code}); no cloud fallback was used."
+                )
+                _dcap.log_route_event(
+                    route=decision.route, reason_code=decision.reason.reason_code,
+                    model=decision.model, outcome="fail_local_only", error=_code,
+                    prompt_sha8=decision.reason.prompt_sha8,
+                )
+                return
+            turn["decision"] = _fb
+            _dcap.log_route_event(
+                route=_fb.route, reason_code=_fb.reason.reason_code, model=_fb.model,
+                provider=_fb.provider, dispatch="agent", fallback=decision.route,
+                error=_code, outcome="fallback_cloud",
+                prompt_sha8=decision.reason.prompt_sha8, pin_preserved=(mode == "pinned"),
+            )
+        except Exception as _exc:
+            logger.warning("Dumbledore %s preflight skipped: %s", decision.route, _exc)
+
+    async def _dmbl_persist_specialist_exchange(self, session_key, event, reply: str) -> None:
+        """Record a specialist exchange in the session transcript through the
+        normal store API (user + assistant entries), so later agent turns and
+        later context packs see it. Nonfatal."""
+        try:
+            if not session_key:
+                return
+            _entry = await self.async_session_store.lookup_by_session_key(session_key)
+            if not _entry:
+                return
+            _ts = time.time()
+            _user_entry = {
+                "role": "user",
+                "content": getattr(event, "text", "") or "",
+                "timestamp": _ts,
+            }
+            if getattr(event, "message_id", None):
+                _user_entry["message_id"] = str(event.message_id)
+            await self.async_session_store.append_to_transcript(_entry.session_id, _user_entry)
+            await self.async_session_store.append_to_transcript(
+                _entry.session_id,
+                {"role": "assistant", "content": reply, "timestamp": _ts},
+            )
+        except Exception as _exc:
+            logger.debug("Dumbledore specialist transcript persist skipped: %s", _exc)
+
+    async def _dmbl_run_specialist_turn(
+        self, event, source, decision, history, mode, turn=None, session_key=None,
+    ) -> bool:
+        """Hard dispatch to a local specialist (CODE_FAST / CODE_HEAVY /
+        DEEP_LOCAL context-pack / explicit local tag) with the bounded
+        specialist context pack, under the shared accelerator lock.
+
+        Chain: CODE_FAST -> CODE_HEAVY (when preflight passes) -> CLOUD_SAFE
+        through the tool-capable agent loop, unless local-only was demanded.
+        The session history is read, never modified; the pin is never written.
+        """
+        from agent import dumbledore_capability_router as _dcap
+
+        _text = getattr(event, "text", "") or ""
+        _adapter = self._adapter_for_source(source)
+        try:
+            _meta = self._thread_metadata_for_source(source, None)
+        except Exception:
+            _meta = None
+
+        async def _send(_msg: str) -> None:
+            if _adapter:
+                await _adapter.send(chat_id=source.chat_id, content=_msg, metadata=_meta)
+
+        _chain = [decision]
+        if decision.route == _dcap.CODE_FAST:
+            _chain.append(_dcap._decision_for_route(
+                _dcap.CODE_HEAVY, _text, code="escalate_code_fast_failed",
+                signals=list(decision.reason.signals) + ["escalation"],
+                pinned=decision.reason.overrides_pin, local_only=decision.local_only,
+                explicit=decision.explicit,
+            ))
+        _governance = [
+            "Advisory reply only: you cannot write files, run commands, or call tools.",
+            "Do not claim to have run, tested, deployed, or verified anything.",
+            "Never reveal credentials, secrets, or private fleet documents.",
+        ]
+        _failures: list = []
+        _failure_codes: list = []
+        for _idx, _dec in enumerate(_chain):
+            if _idx > 0 or _dec.route in (_dcap.CODE_HEAVY, _dcap.DEEP_LOCAL):
+                _loaded = await self._run_in_executor_with_context(_dcap.ollama_loaded_names)
+                _cold = _dec.model not in _loaded
+                await _send(
+                    ("⚠️ " + _failures[-1] + "\n" if _idx > 0 else "")
+                    + f"⚙️ Routing to {_dec.model} ({_dec.route})"
+                    + (" — cold load, this can take a few minutes…" if _cold else " — one moment…")
+                )
+            _pack = _dcap.build_specialist_context_pack(
+                history, _text,
+                budget_tokens=_dcap.SPECIALIST_PACK_BUDGET.get(_dec.model, 20_000),
+                governance=_governance, previous_failures=_failures,
+            )
+            _t0 = time.time()
+
+            def _job(_dec=_dec, _pack=_pack):
+                with _dcap.AcceleratorLock().acquire(
+                    owner="gateway", route=_dec.route, timeout=_dcap.LOCK_TIMEOUT_DEFAULT,
+                ) as _lk:
+                    # Preload keep-alive: an intentional 0 (one-shot heavy) is
+                    # applied on the chat request itself; the preload uses 5m.
+                    _pre = _dcap.prepare_local_target(
+                        _dec.model, route=_dec.route,
+                        keep_alive=(_dec.keep_alive if _dec.keep_alive else "5m"),
+                        exclusive=True, stop_comfy=True,
+                    )
+                    _out = _dcap.run_specialist(
+                        _dec.model, _pack, route=_dec.route, keep_alive=_dec.keep_alive,
+                    )
+                    _out["previous_loaded"] = _pre.get("previous_loaded")
+                    _out["unloaded"] = _pre.get("unloaded")
+                    _out["comfy_stopped"] = _pre.get("comfy_stopped")
+                    _out["preload_seconds"] = _pre.get("load_seconds")
+                    _out["lock"] = _lk.result
+                    return _out
+
+            try:
+                _out = await self._run_in_executor_with_context(_job)
+            except Exception as _exc:
+                _code = type(_exc).__name__
+                _failure_codes.append(_code)
+                _failures.append(f"{_dec.route} ({_dec.model}) failed: {_code}: {str(_exc)[:160]}")
+                _dcap.log_route_event(
+                    route=_dec.route, reason_code=_dec.reason.reason_code, model=_dec.model,
+                    dispatch="specialist", inference_seconds=time.time() - _t0,
+                    outcome="fail", error=_code, prompt_sha8=_dec.reason.prompt_sha8,
+                    fallback=(decision.route if _idx else None),
+                )
+                logger.warning(
+                    "Dumbledore %s specialist failed after %.1fs: %s",
+                    _dec.route, time.time() - _t0, _exc,
+                )
+                continue
+            _dcap.log_route_event(
+                route=_dec.route, reason_code=_dec.reason.reason_code, model=_dec.model,
+                dispatch="specialist", previous_loaded=_out.get("previous_loaded"),
+                unloaded=_out.get("unloaded"), load_seconds=_out.get("preload_seconds"),
+                inference_seconds=_out.get("seconds"), lock=_out.get("lock"),
+                pack_tokens=_pack["tokens"], pack_turns=_pack["turns_included"],
+                pack_truncated=_pack["truncated"],
+                fallback=(decision.route if _idx else None), outcome="ok",
+                keep_alive=_dec.keep_alive, pin_preserved=(mode == "pinned"),
+                comfy=("stopped" if _out.get("comfy_stopped") else None),
+                prompt_sha8=_dec.reason.prompt_sha8,
+            )
+            _reply = _out["content"]
+            if _idx > 0:
+                _reply = (
+                    f"⚠️ {decision.route} failed ({_failure_codes[-1]}); escalated to "
+                    f"{_dec.route} ({_dec.model}).\n\n" + _reply
+                )
+            await _send(_reply + _dcap.route_signature(_dec))
+            await self._dmbl_persist_specialist_exchange(session_key, event, _reply)
+            return True
+
+        # Every local lane failed -> CLOUD_SAFE via the tool-capable agent loop.
+        try:
+            _fb = _dcap.cloud_fallback_decision(
+                decision, _failure_codes[-1] if _failure_codes else "unknown"
+            )
+        except _dcap.LocalOnlyViolation:
+            _dcap.log_route_event(
+                route=decision.route, reason_code=decision.reason.reason_code,
+                model=decision.model, outcome="fail_local_only",
+                error=(_failure_codes[-1] if _failure_codes else "unknown"),
+                prompt_sha8=decision.reason.prompt_sha8,
+            )
+            await _send(
+                "⚠️ Local-only execution was required and every local lane failed; "
+                "no cloud fallback was used:\n" + "\n".join(f"- {f}" for f in _failures)
+            )
+            return True
+        (turn if turn is not None else self._dmbl_turn)["decision"] = _fb
+        self._dmbl_coder_failed = True
+        self._dmbl_coder_failed_text = _fb.notice + "\n" + "\n".join(f"- {f}" for f in _failures)
+        _dcap.log_route_event(
+            route=_fb.route, reason_code=_fb.reason.reason_code, model=_fb.model,
+            provider=_fb.provider, dispatch="agent", fallback=decision.route,
+            error=(_failure_codes[-1] if _failure_codes else None), outcome="fallback_cloud",
+            prompt_sha8=decision.reason.prompt_sha8, pin_preserved=(mode == "pinned"),
+        )
+        return False
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""

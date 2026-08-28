@@ -87,10 +87,21 @@ def _stub_image_lane(monkeypatch, tmp_path):
 
     calls = {"renders": [], "enrichments": [], "paid_renders": []}
     image = tmp_path / "image.png"
-    image.write_bytes(b"png")
+    # A real 1x1 PNG: the capability router verifies renders before delivery.
+    from PIL import Image as _PILImage
+    _PILImage.new("RGB", (1, 1), (0, 0, 0)).save(image)
     monkeypatch.setenv("DUMBLEDORE_ROUTER", "1")
     monkeypatch.setenv("DUMBLEDORE_IMAGE_LANE", "1")
-    monkeypatch.setattr(router, "comfy_is_up", lambda: False)
+    monkeypatch.setattr(router, "comfy_is_up", lambda timeout=2.0: False)
+    from agent import dumbledore_capability_router as _cap
+    monkeypatch.setattr(_cap, "RENDER_DIR", str(tmp_path / "renders"))
+    monkeypatch.setattr(_cap, "LOCK_PATH", str(tmp_path / "accel.lock"))
+    monkeypatch.setattr(_cap, "TELEMETRY_PATH", str(tmp_path / "router.jsonl"))
+    monkeypatch.setattr(_cap, "prepare_for_flux", lambda: {"previous_loaded": [], "unloaded": []})
+    monkeypatch.setattr(_cap, "ollama_ps", lambda timeout=5.0: [])
+    monkeypatch.setattr(_cap, "ollama_loaded_names", lambda timeout=5.0: [])
+    monkeypatch.setattr(_cap, "prepare_local_target", lambda model, **kw: {"previous_loaded": [], "unloaded": [], "load_seconds": 0.0})
+    monkeypatch.setattr(_cap, "run_specialist", lambda model, pack, **kw: {"content": f"{model} stub", "seconds": 0.0, "load_seconds": 0.0})
     monkeypatch.setattr(router, "load_mode", lambda: {"mode": "home"})
     monkeypatch.setattr(router, "log_decision", lambda **kwargs: None)
 
@@ -291,11 +302,14 @@ async def test_bare_brand_arms_next_image_then_reverts_local(monkeypatch, tmp_pa
     await runner._handle_message(_event("Quantum Web Studios Inc in a boardroom"))
     # Brand armed state is consumed: the next EXPLICIT command renders local.
     await runner._handle_message(_event("/quality generate image of a moonlit castle"))
-    # Keyword prose without a prefix no longer routes to the image lane.
+    # 2026-08-27 capability router: a prose generation ORDER ("generate
+    # image of …") is IMAGE_GENERATION again (mission R11) and renders on the
+    # local 4-step default — never the paid lane.
     await runner._handle_message(_event("generate image of a moonlit castle"))
     assert len(calls["paid_renders"]) == 1
-    assert len(calls["renders"]) == 1
-    runner._handle_message_with_agent.assert_awaited_once()
+    assert len(calls["renders"]) == 2
+    assert calls["renders"][-1][1:] == (4, 1024, 1024)
+    runner._handle_message_with_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -356,10 +370,14 @@ async def test_quality_auto_reverts_after_one_image(monkeypatch, tmp_path):
     # Quality reverted: the next EXPLICIT command renders at the 4-step default.
     await runner._handle_message(_event("/literal generate image of a sunlit garden"))
     assert [item[1] for item in calls["renders"]] == [16, 4]
-    # Prefix-only contract: unprefixed prose now passes to the agent loop.
+    # 2026-08-27 capability router: unprefixed prose ORDERS render locally at
+    # the 4-step default (mission R11); questions/file references still don't.
     await runner._handle_message(_event("generate image of a rainy street"))
-    assert len(calls["renders"]) == 2
-    runner._handle_message_with_agent.assert_awaited_once()
+    assert [item[1] for item in calls["renders"]] == [16, 4, 4]
+    await runner._handle_message(_event("did you generate an image of a rainy street?"))
+    await runner._handle_message(_event("crop the image of the rainy street to a square"))
+    assert len(calls["renders"]) == 3
+    assert runner._handle_message_with_agent.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -367,16 +385,17 @@ async def test_cinematic_portrait_regression_stays_enriched(monkeypatch, tmp_pat
     runner, _ = _runner()
     calls = _stub_image_lane(monkeypatch, tmp_path)
     runner._handle_message_with_agent = AsyncMock(return_value=None)
-    # Keyword prose no longer routes to the image lane…
+    # 2026-08-27 capability router: the prose ORDER routes to the image lane,
+    # strips the wrapper, enriches, and renders at the fast default…
     await runner._handle_message(_event("Generate a cinematic portrait of a wizard"))
-    assert calls["renders"] == []
-    runner._handle_message_with_agent.assert_awaited_once()
-    # …but the explicit command still strips the wrapper and enriches.
+    assert calls["renders"] == [("a cinematic portrait of a wizard, enriched detail", 4, 1024, 1024)]
+    runner._handle_message_with_agent.assert_not_awaited()
+    # …and the explicit command still strips the wrapper and enriches.
     await runner._handle_message(
         _event("/quality Generate a cinematic portrait of a wizard")
     )
-    assert calls["enrichments"] == ["a cinematic portrait of a wizard"]
-    assert calls["renders"][0][1:] == (16, 1280, 1280)
+    assert calls["enrichments"] == ["a cinematic portrait of a wizard"] * 2
+    assert calls["renders"][1][1:] == (16, 1280, 1280)
 
 
 @pytest.mark.asyncio

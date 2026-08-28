@@ -292,6 +292,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[image prompt]"),
     CommandDef("brand", "Generate one explicitly paid BFL typography image", "Configuration",
                gateway_only=True, args_hint="[image prompt]"),
+    CommandDef("route", "Dumbledore one-turn route override (home|deep|code|code-heavy|cloud|flux|model|status|auto)",
+               "Configuration", gateway_only=True, args_hint="<verb> [prompt]",
+               subcommands=("home", "deep", "code", "code-heavy", "cloud", "flux", "model", "status", "auto")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -1374,7 +1377,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+#   - route: Dumbledore's Telegram-only local route override (2026-08-27);
+#     reached via /hermes route on Slack. Added at the 50-cap — a native slot
+#     would clamp /help off the native list and break Telegram parity.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "route"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
