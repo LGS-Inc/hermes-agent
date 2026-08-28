@@ -2869,6 +2869,32 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # a fallback-recovery notice after an actual provider fallback.
         agent._provider_fallback_active = True
         agent._provider_fallback_route = (str(fb_model), str(fb_provider))
+        # Machine-readable, content-free execution provenance for the gateway's
+        # canonical route receipt.  This state is telemetry only; the retry and
+        # routing code never consults it.  Keep the human notice above separate
+        # so receipt generation never has to parse user-visible text.
+        _reason_value = getattr(reason, "value", None)
+        _reason_code = (
+            str(_reason_value)[:120]
+            if isinstance(_reason_value, str) and _reason_value
+            else "unknown"
+        )
+        _fallbacks = getattr(agent, "_route_provenance_fallbacks", None)
+        if not isinstance(_fallbacks, list):
+            _fallbacks = agent._route_provenance_fallbacks = []
+        _fallbacks.append(
+            {
+                "from_model": str(old_model or "")[:200],
+                "from_provider": str(old_provider or "")[:200],
+                "to_model": str(fb_model or "")[:200],
+                "to_provider": str(fb_provider or "")[:200],
+                "reason_code": _reason_code,
+                "consumed": False,
+            }
+        )
+        if len(_fallbacks) > 16:
+            del _fallbacks[:-16]
+        agent._route_provenance_last_fallback_reason = _reason_code
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,

@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1038,6 +1039,11 @@ def run_specialist(
         "load_seconds": (data.get("load_duration") or 0) / 1e9,
         "eval_count": data.get("eval_count"),
         "prompt_eval_count": data.get("prompt_eval_count"),
+        # Execution provenance only.  Ollama's response model is the closest
+        # authoritative answer to "what actually served this request"; it can
+        # differ from the requested alias after server-side normalization.
+        "provider": "ollama",
+        "response_model": data.get("model") or model,
     }
 
 
@@ -1385,6 +1391,214 @@ def prepare_for_flux() -> dict:
 # Telemetry (bounded; never prompt text / credentials / QFB content)
 # ---------------------------------------------------------------------------
 
+ROUTE_RECEIPT_VERSION = 3
+ROUTE_RECEIPT_KIND = "dumbledore_turn_receipt"
+ROUTE_RECEIPT_MAX_ATTEMPTS = 32
+_ROUTE_RECEIPT_LOCK = threading.Lock()
+# path -> (byte offset scanned, receipt ids seen).  The log is append-only in
+# production; the offset also lets tests safely truncate/replace a temp log.
+_ROUTE_RECEIPT_CACHE: Dict[str, Tuple[int, set[str]]] = {}
+
+
+def hash_route_identifier(value: Any) -> Optional[str]:
+    """Return a full SHA-256 for an opaque routing identifier.
+
+    Message/session/turn ids are useful joins but can encode private routing
+    facts.  The v3 contract therefore never serializes them verbatim.
+    """
+    if value in (None, ""):
+        return None
+    return hashlib.sha256(str(value).encode("utf-8", "replace")).hexdigest()
+
+
+def derive_turn_receipt_id(
+    *,
+    platform: Any,
+    session_key: Any,
+    message_id: Any = None,
+    platform_update_id: Any = None,
+    fallback_fact: Any = None,
+) -> str:
+    """Derive one deterministic, privacy-safe id for an inbound turn.
+
+    Existing platform/session/message facts are preferred.  ``fallback_fact``
+    is only for synthetic events without a platform message/update id and is
+    hashed as part of the derivation, never emitted.
+    """
+    if message_id not in (None, ""):
+        input_fact = f"message:{message_id}"
+    elif platform_update_id not in (None, ""):
+        input_fact = f"update:{platform_update_id}"
+    else:
+        input_fact = f"fallback:{fallback_fact or 'missing'}"
+    seed = "\0".join(
+        (
+            "dumbledore-route-receipt-v1",
+            str(platform or "unknown").lower(),
+            str(session_key or "session-unknown"),
+            input_fact,
+        )
+    )
+    return hashlib.sha256(seed.encode("utf-8", "replace")).hexdigest()
+
+
+def _receipt_text(value: Any, limit: int = 200) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    return text[:limit]
+
+
+def _receipt_attempts(attempts: Any) -> List[dict]:
+    """Allowlist and bound attempt telemetry; never copy arbitrary mappings."""
+    if not isinstance(attempts, (list, tuple)):
+        return []
+    out: List[dict] = []
+    for raw in list(attempts)[-ROUTE_RECEIPT_MAX_ATTEMPTS:]:
+        if not isinstance(raw, dict):
+            continue
+        rec: Dict[str, Any] = {}
+        try:
+            rec["ordinal"] = max(1, int(raw.get("ordinal") or len(out) + 1))
+        except (TypeError, ValueError):
+            rec["ordinal"] = len(out) + 1
+        _api_id = raw.get("api_request_id")
+        _api_hash = raw.get("api_request_sha256")
+        if _api_id not in (None, ""):
+            rec["api_request_sha256"] = hash_route_identifier(_api_id)
+        elif isinstance(_api_hash, str) and re.fullmatch(r"[0-9a-f]{64}", _api_hash):
+            rec["api_request_sha256"] = _api_hash
+        for key in (
+            "provider", "model", "response_model", "transport", "call_role", "outcome",
+            "error_class", "fallback_reason_code", "fallback_from_provider",
+            "fallback_from_model",
+        ):
+            value = _receipt_text(raw.get(key))
+            if value is not None:
+                rec[key] = value
+        try:
+            rec["retry_index"] = max(0, int(raw.get("retry_index") or 0))
+        except (TypeError, ValueError):
+            rec["retry_index"] = 0
+        rec["local_invocation"] = bool(raw.get("local_invocation", False))
+        out.append(rec)
+    return out
+
+
+def _refresh_receipt_ids(path: str, fh: Any) -> set[str]:
+    fh.seek(0, os.SEEK_END)
+    size = fh.tell()
+    offset, ids = _ROUTE_RECEIPT_CACHE.get(path, (0, set()))
+    if size < offset:
+        offset, ids = 0, set()
+    if size > offset:
+        fh.seek(offset)
+        for line in fh.read(size - offset).splitlines():
+            try:
+                prior = json.loads(line)
+            except Exception:
+                continue
+            if (
+                prior.get("v") == ROUTE_RECEIPT_VERSION
+                and prior.get("kind") == ROUTE_RECEIPT_KIND
+                and isinstance(prior.get("receipt_id"), str)
+            ):
+                ids.add(prior["receipt_id"])
+        offset = size
+    _ROUTE_RECEIPT_CACHE[path] = (offset, ids)
+    return ids
+
+
+def log_turn_receipt(**fields: Any) -> dict:
+    """Append one canonical v3 execution receipt for an input turn.
+
+    This is telemetry only.  It cannot influence routing, authorization, model
+    selection, retry, persistence, or delivery.  Every serialized field is
+    explicitly allowlisted; raw identifiers and arbitrary error text are
+    intentionally impossible to write through this function.
+    """
+    raw_receipt_id = fields.get("receipt_id")
+    if isinstance(raw_receipt_id, str) and re.fullmatch(r"[0-9a-f]{64}", raw_receipt_id):
+        receipt_id = raw_receipt_id
+    else:
+        receipt_id = hash_route_identifier(raw_receipt_id or "missing-receipt-id")
+    rec: Dict[str, Any] = {
+        "v": ROUTE_RECEIPT_VERSION,
+        "kind": ROUTE_RECEIPT_KIND,
+        "ts": round(time.time(), 3),
+        "receipt_id": receipt_id,
+    }
+
+    for key in (
+        "platform", "classifier_route", "reason_code", "requested_route",
+        "requested_model", "requested_provider", "requested_dispatch",
+        "override_type", "override_model", "override_provider",
+        "fallback_reason_code", "actual_provider", "actual_model",
+        "response_model", "final_effective_provider", "final_effective_model",
+        "completion_outcome", "rollover_reason",
+    ):
+        value = _receipt_text(fields.get(key))
+        if value is not None:
+            rec[key] = value
+
+    signals = fields.get("classifier_signals")
+    if isinstance(signals, (list, tuple)):
+        rec["classifier_signals"] = [
+            value for value in (_receipt_text(v, 80) for v in signals[:16]) if value
+        ]
+
+    id_fields = {
+        "session_key_sha256": "session_key",
+        "platform_message_sha256": "message_id",
+        "platform_update_sha256": "platform_update_id",
+        "input_session_sha256": "input_session_id",
+        "effective_session_sha256": "effective_session_id",
+        "agent_turn_sha256": "agent_turn_id",
+        "rollover_parent_sha256": "rollover_parent_session_id",
+        "rollover_child_sha256": "rollover_child_session_id",
+    }
+    for output_key, input_key in id_fields.items():
+        hashed = hash_route_identifier(fields.get(input_key))
+        if hashed:
+            rec[output_key] = hashed
+
+    for key in (
+        "pin_preserved", "explicit", "local_invocation", "cloud_fallback",
+        "rollover_occurred",
+    ):
+        rec[key] = bool(fields.get(key, False))
+    try:
+        rec["run_generation"] = max(0, int(fields.get("run_generation") or 0))
+    except (TypeError, ValueError):
+        rec["run_generation"] = 0
+    try:
+        rec["attempts_truncated"] = max(0, int(fields.get("attempts_truncated") or 0))
+    except (TypeError, ValueError):
+        rec["attempts_truncated"] = 0
+    rec["attempts"] = _receipt_attempts(fields.get("attempts"))
+
+    path = TELEMETRY_PATH
+    try:
+        with _ROUTE_RECEIPT_LOCK:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a+", encoding="utf-8") as fh:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                ids = _refresh_receipt_ids(path, fh)
+                if receipt_id in ids:
+                    duplicate = dict(rec)
+                    duplicate["deduplicated"] = True
+                    return duplicate
+                fh.seek(0, os.SEEK_END)
+                fh.write(json.dumps(rec, default=str, separators=(",", ":")) + "\n")
+                fh.flush()
+                ids.add(receipt_id)
+                _ROUTE_RECEIPT_CACHE[path] = (fh.tell(), ids)
+    except Exception:
+        # Telemetry is deliberately non-authoritative and fail-open for runtime
+        # behavior; a receipt write can never fail or redirect a user turn.
+        pass
+    return rec
+
 _TELEMETRY_KEYS = (
     "route", "reason_code", "signals", "confidence", "model", "provider", "dispatch",
     "previous_loaded", "unloaded", "load_seconds", "inference_seconds", "fallback",
@@ -1429,7 +1643,10 @@ def recent_route_events(n: int = 5) -> List[dict]:
         with open(TELEMETRY_PATH, "rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
-            fh.seek(max(0, size - 64_000))
+            # v3 receipts share this append-only file and can contain a bounded
+            # attempt list.  Keep enough tail for the legacy v2 status reader to
+            # find the same recent operational events it did before receipts.
+            fh.seek(max(0, size - 512_000))
             lines = fh.read().decode("utf-8", "replace").splitlines()
     except Exception:
         return []

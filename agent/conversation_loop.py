@@ -25,6 +25,7 @@ import ssl
 import sys
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
@@ -113,7 +114,98 @@ _DUMBLEDORE_NEVER_REDIRECT_TOOLS = frozenset({
     "search_files",
 })
 
+_ROUTE_PROVENANCE_ATTEMPT_LIMIT = 32
 
+
+def _route_provenance_local(agent) -> bool:
+    """Classify execution locality without retaining an endpoint URL."""
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "").strip()
+    try:
+        parsed = urlparse(base_url if "://" in base_url else f"http://{base_url}")
+        endpoint_host = str(parsed.hostname or "").rstrip(".").lower()
+    except (TypeError, ValueError):
+        endpoint_host = ""
+    return bool(
+        provider in {"ollama", "lmstudio", "llama-cpp", "llamacpp"}
+        or endpoint_host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+    )
+
+
+def _route_provenance_begin_attempt(
+    agent,
+    *,
+    api_request_id: str,
+    retry_index: int,
+    call_role: str,
+) -> dict:
+    attempts = getattr(agent, "_route_provenance_attempts", None)
+    if not isinstance(attempts, list):
+        attempts = agent._route_provenance_attempts = []
+    ordinal = int(getattr(agent, "_route_provenance_attempt_ordinal", 0) or 0) + 1
+    agent._route_provenance_attempt_ordinal = ordinal
+    attempt = {
+        "ordinal": ordinal,
+        "api_request_id": str(api_request_id or ""),
+        "retry_index": max(0, int(retry_index or 0)),
+        "provider": str(getattr(agent, "provider", "") or "")[:200],
+        "model": str(getattr(agent, "model", "") or "")[:200],
+        "transport": "agent",
+        "call_role": str(call_role or "primary")[:80],
+        "local_invocation": _route_provenance_local(agent),
+        "outcome": "started",
+    }
+    # Attach a machine-readable provider transition to the first real attempt
+    # on the new runtime.  Human fallback notices are never parsed or logged.
+    fallbacks = getattr(agent, "_route_provenance_fallbacks", None)
+    if isinstance(fallbacks, list):
+        for transition in reversed(fallbacks):
+            if not isinstance(transition, dict) or transition.get("consumed"):
+                continue
+            if (
+                str(transition.get("to_model") or "") == attempt["model"]
+                and str(transition.get("to_provider") or "") == attempt["provider"]
+            ):
+                transition["consumed"] = True
+                attempt["fallback_reason_code"] = str(
+                    transition.get("reason_code") or "unknown"
+                )[:120]
+                attempt["fallback_from_model"] = str(
+                    transition.get("from_model") or ""
+                )[:200]
+                attempt["fallback_from_provider"] = str(
+                    transition.get("from_provider") or ""
+                )[:200]
+                break
+    attempts.append(attempt)
+    if len(attempts) > _ROUTE_PROVENANCE_ATTEMPT_LIMIT:
+        del attempts[0 : len(attempts) - _ROUTE_PROVENANCE_ATTEMPT_LIMIT]
+        agent._route_provenance_attempts_truncated = int(
+            getattr(agent, "_route_provenance_attempts_truncated", 0) or 0
+        ) + 1
+    return attempt
+
+
+def _route_provenance_finish_attempt(
+    attempt: dict,
+    *,
+    outcome: str,
+    response: Any = None,
+    error: Optional[BaseException] = None,
+) -> None:
+    attempt["outcome"] = str(outcome or "unknown")[:80]
+    if error is not None:
+        attempt["error_class"] = type(error).__name__[:120]
+    response_model = None
+    try:
+        if isinstance(response, dict):
+            response_model = response.get("model")
+        elif response is not None:
+            response_model = getattr(response, "model", None)
+    except Exception:
+        response_model = None
+    if response_model not in (None, ""):
+        attempt["response_model"] = str(response_model)[:200]
 def _dumbledore_user_image_command(user_text: str) -> bool:
     """True only when the user's message leads with an image control prefix."""
     tokens = (user_text or "").lstrip().split()
@@ -2022,6 +2114,13 @@ def run_conversation(
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
+    # Per-turn, bounded execution-only ledger consumed by the gateway's
+    # Dumbledore v3 receipt.  It is deliberately not part of the prompt,
+    # transcript, routing decision, or provider request.
+    agent._route_provenance_attempts = []
+    agent._route_provenance_fallbacks = []
+    agent._route_provenance_attempt_ordinal = 0
+    agent._route_provenance_attempts_truncated = 0
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
@@ -3314,23 +3413,50 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                _call_role = (
+                    "delegated"
+                    if getattr(agent, "is_subagent", False)
+                    else "fallback"
+                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                    else "primary"
+                )
+                _route_attempt = _route_provenance_begin_attempt(
+                    agent,
+                    api_request_id=api_request_id,
+                    retry_index=retry_count,
+                    call_role=_call_role,
+                )
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    try:
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
+                    except BaseException as _route_attempt_error:
+                        _route_provenance_finish_attempt(
+                            _route_attempt,
+                            outcome="error",
+                            error=_route_attempt_error,
+                        )
+                        raise
+                    else:
+                        _route_provenance_finish_attempt(
+                            _route_attempt,
+                            outcome="returned",
+                            response=response,
+                        )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -3354,8 +3480,10 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
                     if agent.clear_interrupt(preserve_redirect=True):
+                        _route_attempt["outcome"] = "redirected_stale_response"
                         _retry.restart_with_redirected_messages = True
                     else:
+                        _route_attempt["outcome"] = "interrupted"
                         interrupted = True
                     break
                 
@@ -3458,6 +3586,8 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    _route_attempt["outcome"] = "invalid_response"
+                    _route_attempt["error_class"] = "InvalidResponse"
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,

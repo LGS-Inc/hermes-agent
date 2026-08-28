@@ -2,9 +2,19 @@
 title: "请求代码审查 — 提交前审查：安全扫描、质量门控、自动修复"
 sidebar_label: "请求代码审查"
 description: "提交前审查：安全扫描、质量门控、自动修复"
+governance_status: "SUPERSEDED"
+authority_status: "REFERENCE_ONLY"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+:::warning 已取代的参考资料
+此自动生成的 v2.0 页面属于 `SUPERSEDED` 和 `REFERENCE_ONLY`；不得执行其中的
+自动启动、自动修复或提交工作流。Dumbledore 当前的 v2.1 skill 位于
+`/home/qws/.hermes/skills/software-development/requesting-code-review/SKILL.md`。
+命名的 Independent Review 仍须根据 Fleet Protocol Registry 由 Chairman 明确激活。
+以下正文仅作为历史参考保留。
+:::
 
 # 请求代码审查
 

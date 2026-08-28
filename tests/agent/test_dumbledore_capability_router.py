@@ -551,6 +551,92 @@ def test_telemetry_is_bounded_and_prompt_free(tmp_path, monkeypatch):
     assert cap.recent_route_events(1)[0]["route"] == cap.CODE_HEAVY
 
 
+def test_turn_receipt_v3_is_private_bounded_deterministic_and_deduplicated(
+    tmp_path, monkeypatch
+):
+    path = str(tmp_path / "router.jsonl")
+    monkeypatch.setattr(cap, "TELEMETRY_PATH", path)
+    session_key = "agent:main:telegram:dm:private-chat-id"
+    message_id = "private-message-123"
+    receipt_id = cap.derive_turn_receipt_id(
+        platform="telegram", session_key=session_key, message_id=message_id
+    )
+    assert receipt_id == cap.derive_turn_receipt_id(
+        platform="telegram", session_key=session_key, message_id=message_id
+    )
+    assert receipt_id != cap.derive_turn_receipt_id(
+        platform="telegram", session_key=session_key, message_id="private-message-124"
+    )
+
+    attempts = [
+        {
+            "ordinal": i,
+            "api_request_id": f"raw-request-{i}",
+            "retry_index": i - 1,
+            "provider": "custom:qwen",
+            "model": cap.HOME_FAST_MODEL,
+            "transport": "agent",
+            "local_invocation": True,
+            "outcome": "returned",
+            # Arbitrary fields must never cross the receipt allowlist.
+            "prompt": "TOP SECRET PROMPT",
+            "error_text": "credential sk-live-secret",
+        }
+        for i in range(1, 41)
+    ]
+    kwargs = dict(
+        receipt_id=receipt_id,
+        platform="telegram",
+        session_key=session_key,
+        message_id=message_id,
+        platform_update_id="raw-update-7",
+        input_session_id="raw-parent-session",
+        effective_session_id="raw-child-session",
+        agent_turn_id="raw-agent-turn",
+        classifier_route=cap.HOME_FAST,
+        reason_code="routine_default",
+        requested_route=cap.HOME_FAST,
+        requested_model=cap.HOME_FAST_MODEL,
+        requested_provider=cap.HOME_FAST_PROVIDER,
+        requested_dispatch="agent",
+        attempts=attempts,
+        attempts_truncated=8,
+        actual_provider=cap.HOME_FAST_PROVIDER,
+        actual_model=cap.HOME_FAST_MODEL,
+        final_effective_provider=cap.HOME_FAST_PROVIDER,
+        final_effective_model=cap.HOME_FAST_MODEL,
+        completion_outcome="completed",
+        local_invocation=True,
+        prompt="TOP SECRET PROMPT",
+        error="credential sk-live-secret",
+    )
+    first = cap.log_turn_receipt(**kwargs)
+    second = cap.log_turn_receipt(**kwargs)
+
+    lines = [json.loads(line) for line in open(path).read().splitlines()]
+    assert len(lines) == 1
+    rec = lines[0]
+    assert first["v"] == 3 and rec["kind"] == cap.ROUTE_RECEIPT_KIND
+    assert second["deduplicated"] is True
+    assert len(rec["attempts"]) == cap.ROUTE_RECEIPT_MAX_ATTEMPTS
+    assert rec["attempts"][0]["ordinal"] == 9
+    assert rec["attempts"][-1]["ordinal"] == 40
+    assert rec["platform_message_sha256"] == cap.hash_route_identifier(message_id)
+    serialized = json.dumps(rec)
+    for forbidden in (
+        session_key,
+        message_id,
+        "raw-update-7",
+        "raw-parent-session",
+        "raw-child-session",
+        "raw-agent-turn",
+        "raw-request-40",
+        "TOP SECRET PROMPT",
+        "sk-live-secret",
+    ):
+        assert forbidden not in serialized
+
+
 def test_verify_png_rejects_empty_and_non_png(tmp_path):
     empty = tmp_path / "e.png"
     empty.write_bytes(b"")
@@ -585,7 +671,12 @@ def test_specialist_request_carries_no_tools(monkeypatch):
             return None
 
         def json(self):
-            return {"message": {"content": "done"}, "load_duration": 5e8, "eval_count": 3}
+            return {
+                "message": {"content": "done"},
+                "model": "qwen3-coder-next:normalized",
+                "load_duration": 5e8,
+                "eval_count": 3,
+            }
 
     class _Client:
         def __init__(self, **kw):
@@ -607,6 +698,8 @@ def test_specialist_request_carries_no_tools(monkeypatch):
     pack = cap.build_specialist_context_pack([], "task", budget_tokens=4000)
     out = cap.run_specialist(cap.CODE_HEAVY_MODEL, pack, route=cap.CODE_HEAVY, keep_alive=0)
     assert out["content"] == "done" and out["load_seconds"] == 0.5
+    assert out["provider"] == "ollama"
+    assert out["response_model"] == "qwen3-coder-next:normalized"
     p = captured["payload"]
     assert "tools" not in p and p["keep_alive"] == 0 and p["model"] == cap.CODE_HEAVY_MODEL
     assert p["options"]["num_ctx"] == cap.CONTEXT_WINDOW[cap.CODE_HEAVY_MODEL]

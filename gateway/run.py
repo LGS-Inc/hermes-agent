@@ -6642,6 +6642,17 @@ class TurnRunner:
             _output_toks = getattr(_agent, "session_completion_tokens", 0)
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
         _resolved_model = getattr(_agent, "model", None) if _agent else None
+        _resolved_provider = getattr(_agent, "provider", None) if _agent else None
+        _route_provenance_turn_id = getattr(_agent, "_current_turn_id", None) if _agent else None
+        _route_provenance_attempts = list(
+            getattr(_agent, "_route_provenance_attempts", []) or []
+        ) if _agent else []
+        _route_provenance_fallbacks = list(
+            getattr(_agent, "_route_provenance_fallbacks", []) or []
+        ) if _agent else []
+        _route_provenance_attempts_truncated = int(
+            getattr(_agent, "_route_provenance_attempts_truncated", 0) or 0
+        ) if _agent else 0
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -6777,6 +6788,13 @@ class TurnRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": _resolved_provider,
+                "route_provenance_turn_id": _route_provenance_turn_id,
+                "route_provenance_attempts": _route_provenance_attempts,
+                "route_provenance_fallbacks": _route_provenance_fallbacks,
+                "route_provenance_attempts_truncated": _route_provenance_attempts_truncated,
+                "route_provenance_run_generation": ctx.run_generation,
+                "route_provenance_session_was_split": _session_was_split,
                 "context_length": _context_length,
             }
 
@@ -6858,6 +6876,13 @@ class TurnRunner:
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
             "model": _resolved_model,
+            "provider": _resolved_provider,
+            "route_provenance_turn_id": _route_provenance_turn_id,
+            "route_provenance_attempts": _route_provenance_attempts,
+            "route_provenance_fallbacks": _route_provenance_fallbacks,
+            "route_provenance_attempts_truncated": _route_provenance_attempts_truncated,
+            "route_provenance_run_generation": ctx.run_generation,
+            "route_provenance_session_was_split": _session_was_split,
             "context_length": _context_length,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
@@ -19136,6 +19161,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _agent_result = None
 
         try:
             try:
@@ -19173,6 +19199,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            # Last-resort terminal receipt for rejected/exceptional agent paths.
+            # Successful paths already finalized from the actual agent result;
+            # the in-memory flag plus deterministic writer make this a no-op.
+            try:
+                _receipt_turn = (
+                    (getattr(self, "_dmbl_turns", None) or {}).get(_quick_key)
+                    or {}
+                )
+                if isinstance(_receipt_turn.get("route_receipt"), dict):
+                    await self._dmbl_finalize_route_receipt(
+                        _receipt_turn,
+                        agent_result=(
+                            _agent_result if isinstance(_agent_result, dict) else None
+                        ),
+                        completion_outcome=(
+                            None
+                            if isinstance(_agent_result, dict)
+                            else "rejected_or_gateway_error"
+                        ),
+                        run_generation=_run_generation,
+                    )
+            except Exception as _dmbl_terminal_receipt_exc:
+                logger.debug(
+                    "Dumbledore terminal route receipt skipped: %s",
+                    _dmbl_terminal_receipt_exc,
+                )
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
             # (_moa_restore_override), which is discarded once the event goes
@@ -21719,6 +21771,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             response = response + _dcap.route_signature(_dec)
                 except Exception as _dmbl_post_exc:
                     logger.debug("Dumbledore capability post-turn skipped: %s", _dmbl_post_exc)
+
+                # Canonical v3 execution receipt.  Unlike the backward-compatible
+                # v2 operational events above, this terminal record is built from
+                # the actual agent result after retry/fallback and is emitted once.
+                try:
+                    _receipt_turn = (
+                        (getattr(self, "_dmbl_turns", None) or {}).get(session_key)
+                        or getattr(self, "_dmbl_turn", None)
+                        or {}
+                    )
+                    await self._dmbl_finalize_route_receipt(
+                        _receipt_turn,
+                        agent_result=agent_result,
+                        effective_session_id=agent_result.get("session_id"),
+                        run_generation=run_generation,
+                        agent_turn_id=agent_result.get("route_provenance_turn_id"),
+                    )
+                except Exception as _dmbl_receipt_exc:
+                    logger.debug(
+                        "Dumbledore route receipt skipped: %s", _dmbl_receipt_exc
+                    )
 
             # Dumbledore router reply post-processor (flag-gated, fail-safe):
             #  * append the image-overflow notice when set;
@@ -25899,6 +25972,437 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None, None
         return _override.get("model"), _override.get("provider")
 
+    async def _dmbl_build_receipt_context(
+        self,
+        *,
+        event: Any,
+        source: Any,
+        session_key: Optional[str],
+        decision: Any,
+        mode: str,
+        pin_model: Optional[str],
+        pin_provider: Optional[str],
+        route_armed: Any,
+    ) -> dict:
+        """Build an execution-telemetry context without exposing raw ids.
+
+        Raw platform/session facts remain in memory only and are hashed by the
+        capability router's v3 writer.  This context is never consulted by the
+        router, authorization gates, retry policy, persistence, or delivery.
+        """
+        import hashlib as _hashlib
+        from agent import dumbledore_capability_router as _dcap
+
+        platform = getattr(getattr(source, "platform", None), "value", None)
+        platform = str(platform or getattr(source, "platform", None) or "unknown")
+        message_id = getattr(event, "message_id", None) or getattr(source, "message_id", None)
+        update_id = getattr(event, "platform_update_id", None)
+        text = getattr(event, "text", "") or ""
+        timestamp = getattr(event, "timestamp", None)
+        timestamp_fact = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp or "")
+        fallback_fact = timestamp_fact + ":" + _hashlib.sha256(
+            text.encode("utf-8", "replace")
+        ).hexdigest()
+        input_session_id = None
+        try:
+            if session_key:
+                entry = await self.async_session_store.lookup_by_session_key(session_key)
+                input_session_id = getattr(entry, "session_id", None) if entry else None
+        except Exception:
+            input_session_id = None
+
+        armed = route_armed if isinstance(route_armed, dict) else {}
+        if armed:
+            override_type = "model_once" if armed.get("model") else "route_once"
+            override_model = armed.get("model") or getattr(decision, "model", None)
+            override_provider = getattr(decision, "provider", None)
+        elif mode == "pinned" and pin_model:
+            override_type = "persistent_pin"
+            override_model = pin_model
+            override_provider = pin_provider
+        else:
+            override_type = "none"
+            override_model = override_provider = None
+
+        return {
+            "receipt_id": _dcap.derive_turn_receipt_id(
+                platform=platform,
+                session_key=session_key,
+                message_id=message_id,
+                platform_update_id=update_id,
+                fallback_fact=fallback_fact,
+            ),
+            "platform": platform,
+            "session_key": session_key,
+            "message_id": message_id,
+            "platform_update_id": update_id,
+            "input_session_id": input_session_id,
+            "requested_decision": decision,
+            "override_type": override_type,
+            "override_model": override_model,
+            "override_provider": override_provider,
+            "pin_preserved": bool(pin_model),
+            "attempts": [],
+            "attempts_truncated": 0,
+            "attempt_ordinal": 0,
+            "emitted": False,
+        }
+
+    async def _dmbl_transition_queued_route_receipt(
+        self,
+        *,
+        current_session_key: Optional[str],
+        current_agent_result: Optional[dict],
+        queued_event: Any,
+        queued_message: str,
+        queued_message_id: Any,
+        queued_source: Any,
+        queued_session_key: Optional[str],
+        run_generation: Any,
+    ) -> Optional[dict]:
+        """Close one routed turn and bind a fresh receipt to its queued successor.
+
+        Queued turns intentionally keep the runtime decision that the existing
+        recursive ``_run_agent`` path already inherits.  This helper is telemetry
+        only: it neither reclassifies the queued prompt nor changes model policy.
+        """
+        if os.environ.get("DUMBLEDORE_ROUTER") != "1":
+            return None
+        turns = getattr(self, "_dmbl_turns", None)
+        if not isinstance(turns, dict):
+            return None
+        current_turn = turns.get(current_session_key) if current_session_key else None
+        if not isinstance(current_turn, dict):
+            return None
+        current_receipt = current_turn.get("route_receipt")
+        if not isinstance(current_receipt, dict):
+            return None
+
+        current_result = (
+            current_agent_result if isinstance(current_agent_result, dict) else {}
+        )
+        await self._dmbl_finalize_route_receipt(
+            current_turn,
+            agent_result=current_result,
+            effective_session_id=current_result.get("session_id"),
+            run_generation=run_generation,
+            agent_turn_id=current_result.get("route_provenance_turn_id"),
+        )
+
+        inherited_requested = (
+            current_turn.get("decision")
+            or current_turn.get("requested_decision")
+            or current_receipt.get("requested_decision")
+        )
+        inherited_active = current_turn.get("decision")
+        if "decision" not in current_turn:
+            inherited_active = inherited_requested
+
+        if queued_event is None:
+            from types import SimpleNamespace
+
+            from agent import dumbledore_capability_router as _dcap
+
+            synthetic_update_fact = _dcap.hash_route_identifier(
+                "queued-receipt:"
+                f"{current_receipt.get('receipt_id') or 'missing'}:"
+                f"{run_generation if run_generation is not None else 0}"
+            )
+
+            queued_event = SimpleNamespace(
+                text=queued_message or "",
+                message_id=queued_message_id,
+                # The receipt writer hashes identifiers again; this deterministic
+                # lineage fact prevents same-text queued turns from colliding
+                # without exposing the prior receipt identifier.
+                platform_update_id=synthetic_update_fact,
+                timestamp=None,
+            )
+
+        from agent import dumbledore_router as _dmbl
+
+        mode = "home"
+        pin_model = pin_provider = None
+        try:
+            mode = _dmbl.load_mode().get("mode", "home")
+            if mode == "pinned":
+                pin_model, pin_provider = self._dmbl_pin_info(queued_session_key)
+                if not pin_model:
+                    mode = "home"
+        except Exception:
+            mode = "home"
+            pin_model = pin_provider = None
+
+        queued_receipt = await self._dmbl_build_receipt_context(
+            event=queued_event,
+            source=queued_source,
+            session_key=queued_session_key,
+            decision=inherited_requested,
+            mode=mode,
+            pin_model=pin_model,
+            pin_provider=pin_provider,
+            route_armed=None,
+        )
+        queued_turn = {
+            "prompt": queued_message or "",
+            "has_image": bool(getattr(queued_event, "media_urls", None)),
+            "requested_decision": inherited_requested,
+            "decision": inherited_active,
+            "session_key": queued_session_key,
+            "route_receipt": queued_receipt,
+            "queued_inherited_route": True,
+        }
+        target_key = queued_session_key or current_session_key
+        if target_key:
+            turns[target_key] = queued_turn
+        return queued_turn
+
+    @staticmethod
+    def _dmbl_add_receipt_attempt(
+        turn: Optional[dict],
+        *,
+        provider: Any,
+        model: Any,
+        transport: str,
+        outcome: str = "started",
+        retry_index: int = 0,
+        local_invocation: bool = False,
+        api_request_id: Any = None,
+        response_model: Any = None,
+        error_class: Any = None,
+        fallback_reason_code: Any = None,
+        fallback_from_provider: Any = None,
+        fallback_from_model: Any = None,
+    ) -> Optional[dict]:
+        if not isinstance(turn, dict):
+            return None
+        receipt = turn.get("route_receipt")
+        if not isinstance(receipt, dict) or receipt.get("emitted"):
+            return None
+        ordinal = int(receipt.get("attempt_ordinal") or 0) + 1
+        receipt["attempt_ordinal"] = ordinal
+        attempt = {
+            "ordinal": ordinal,
+            "provider": str(provider or "")[:200],
+            "model": str(model or "")[:200],
+            "transport": str(transport or "unknown")[:80],
+            "outcome": str(outcome or "unknown")[:80],
+            "retry_index": max(0, int(retry_index or 0)),
+            "local_invocation": bool(local_invocation),
+        }
+        for key, value, limit in (
+            ("api_request_id", api_request_id, 500),
+            ("response_model", response_model, 200),
+            ("error_class", error_class, 120),
+            ("fallback_reason_code", fallback_reason_code, 120),
+            ("fallback_from_provider", fallback_from_provider, 200),
+            ("fallback_from_model", fallback_from_model, 200),
+        ):
+            if value not in (None, ""):
+                attempt[key] = str(value)[:limit]
+        attempts = receipt.setdefault("attempts", [])
+        attempts.append(attempt)
+        from agent import dumbledore_capability_router as _dcap
+        if len(attempts) > _dcap.ROUTE_RECEIPT_MAX_ATTEMPTS:
+            drop = len(attempts) - _dcap.ROUTE_RECEIPT_MAX_ATTEMPTS
+            del attempts[:drop]
+            receipt["attempts_truncated"] = int(receipt.get("attempts_truncated") or 0) + drop
+        return attempt
+
+    async def _dmbl_finalize_route_receipt(
+        self,
+        turn: Optional[dict],
+        *,
+        agent_result: Optional[dict] = None,
+        actual_provider: Any = None,
+        actual_model: Any = None,
+        response_model: Any = None,
+        completion_outcome: Optional[str] = None,
+        effective_session_id: Any = None,
+        run_generation: Any = None,
+        agent_turn_id: Any = None,
+    ) -> Optional[dict]:
+        """Emit the one canonical receipt at the terminal delivery boundary."""
+        if not isinstance(turn, dict):
+            return None
+        receipt = turn.get("route_receipt")
+        if not isinstance(receipt, dict) or receipt.get("emitted"):
+            return None
+        receipt["emitted"] = True
+        from agent import dumbledore_capability_router as _dcap
+
+        result = agent_result if isinstance(agent_result, dict) else {}
+        requested = receipt.get("requested_decision") or turn.get("requested_decision")
+        active = turn.get("decision") or requested
+
+        combined_attempts = list(receipt.get("attempts") or [])
+        agent_attempts = result.get("route_provenance_attempts")
+        if isinstance(agent_attempts, list):
+            combined_attempts.extend(a for a in agent_attempts if isinstance(a, dict))
+        combined_drop = max(
+            0, len(combined_attempts) - _dcap.ROUTE_RECEIPT_MAX_ATTEMPTS
+        )
+        combined_attempts = combined_attempts[-_dcap.ROUTE_RECEIPT_MAX_ATTEMPTS:]
+        combined_attempts = [
+            {**attempt, "ordinal": ordinal}
+            for ordinal, attempt in enumerate(combined_attempts, 1)
+        ]
+        attempts_truncated = int(receipt.get("attempts_truncated") or 0) + int(
+            result.get("route_provenance_attempts_truncated") or 0
+        ) + combined_drop
+
+        fallbacks = result.get("route_provenance_fallbacks")
+        fallback_reason = turn.get("route_fallback_reason")
+        if isinstance(fallbacks, list):
+            for transition in reversed(fallbacks):
+                if isinstance(transition, dict) and transition.get("reason_code"):
+                    fallback_reason = transition.get("reason_code")
+                    break
+        if not fallback_reason:
+            reason = getattr(active, "reason", None)
+            reason_code = str(getattr(reason, "reason_code", "") or "")
+            if reason_code.startswith("fallback:"):
+                fallback_reason = reason_code
+
+        actual_provider = actual_provider or result.get("provider")
+        actual_model = actual_model or result.get("model")
+        winning_attempt = None
+        for candidate in reversed(combined_attempts):
+            if candidate.get("outcome") in {"returned", "ok", "success"}:
+                winning_attempt = candidate
+                break
+        if winning_attempt:
+            actual_provider = actual_provider or winning_attempt.get("provider")
+            actual_model = actual_model or winning_attempt.get("model")
+            response_model = response_model or winning_attempt.get("response_model")
+        response_model = response_model or actual_model
+
+        if completion_outcome is None:
+            if result.get("interrupted"):
+                completion_outcome = "interrupted"
+            elif result.get("failed"):
+                completion_outcome = "failed"
+            elif result.get("completed") is False:
+                completion_outcome = "incomplete"
+            elif result.get("final_response"):
+                completion_outcome = "completed"
+            else:
+                completion_outcome = "empty"
+
+        if effective_session_id in (None, ""):
+            effective_session_id = result.get("session_id")
+        current_entry = None
+        try:
+            if receipt.get("session_key"):
+                current_entry = await self.async_session_store.lookup_by_session_key(
+                    receipt["session_key"]
+                )
+                effective_session_id = effective_session_id or getattr(
+                    current_entry, "session_id", None
+                )
+        except Exception:
+            current_entry = None
+        input_session_id = receipt.get("input_session_id")
+        session_ids_changed = bool(
+            input_session_id
+            and effective_session_id
+            and str(input_session_id) != str(effective_session_id)
+        )
+        rollover_occurred = bool(
+            session_ids_changed
+            and result.get("route_provenance_session_was_split")
+        )
+        rollover_reason = "compression_split" if rollover_occurred else None
+        if current_entry is not None:
+            metadata = getattr(current_entry, "metadata", None) or {}
+            stamp = metadata.get("context_rollover")
+            if isinstance(stamp, dict):
+                stamped_parent = stamp.get("source_session")
+                # The child keeps this stamp for its full lifetime.  It proves
+                # a rollover only for the turn whose input was that exact
+                # parent; later turns already begin in the child and must not
+                # be mislabeled as fresh rollovers.
+                if (
+                    stamped_parent
+                    and input_session_id
+                    and effective_session_id
+                    and str(stamped_parent) == str(input_session_id)
+                    and str(input_session_id) != str(effective_session_id)
+                ):
+                    rollover_occurred = True
+                    rollover_reason = stamp.get("reason")
+        rollover_parent = input_session_id if rollover_occurred else None
+        rollover_child = effective_session_id if rollover_occurred else None
+        if rollover_occurred and not rollover_reason:
+            rollover_reason = "compression_split"
+
+        requested_model = getattr(requested, "model", None)
+        requested_provider = getattr(requested, "provider", None)
+        requested_local = bool(
+            requested_model in _dcap.LOCAL_SPECIALIST_MODELS
+            or getattr(requested, "dispatch", None) == "specialist"
+        )
+        local_invocation = any(bool(a.get("local_invocation")) for a in combined_attempts)
+        winning_attempt_local = bool(
+            winning_attempt and winning_attempt.get("local_invocation")
+        )
+        final_local = bool(
+            str(actual_provider or "").lower() == "ollama"
+            or str(actual_provider or "").lower() in {
+                "lmstudio", "llama-cpp", "llamacpp"
+            }
+            or winning_attempt_local
+        )
+        final_execution_known = bool(
+            actual_provider or actual_model or winning_attempt
+        )
+        cloud_fallback = bool(
+            requested_local
+            and final_execution_known
+            and not final_local
+            and (fallback_reason or combined_attempts)
+        )
+        reason = getattr(requested, "reason", None)
+
+        return _dcap.log_turn_receipt(
+            receipt_id=receipt.get("receipt_id"),
+            platform=receipt.get("platform"),
+            session_key=receipt.get("session_key"),
+            message_id=receipt.get("message_id"),
+            platform_update_id=receipt.get("platform_update_id"),
+            input_session_id=input_session_id,
+            effective_session_id=effective_session_id,
+            agent_turn_id=agent_turn_id or result.get("route_provenance_turn_id"),
+            run_generation=run_generation or result.get("route_provenance_run_generation"),
+            classifier_route=getattr(reason, "route", None) or getattr(requested, "route", None),
+            reason_code=getattr(reason, "reason_code", None),
+            classifier_signals=getattr(reason, "signals", None),
+            requested_route=getattr(requested, "route", None),
+            requested_model=requested_model,
+            requested_provider=requested_provider,
+            requested_dispatch=getattr(requested, "dispatch", None),
+            override_type=receipt.get("override_type"),
+            override_model=receipt.get("override_model"),
+            override_provider=receipt.get("override_provider"),
+            pin_preserved=receipt.get("pin_preserved"),
+            explicit=bool(getattr(requested, "explicit", False)),
+            attempts=combined_attempts,
+            attempts_truncated=attempts_truncated,
+            fallback_reason_code=fallback_reason,
+            actual_provider=actual_provider,
+            actual_model=actual_model,
+            response_model=response_model,
+            local_invocation=local_invocation,
+            cloud_fallback=cloud_fallback,
+            final_effective_provider=actual_provider,
+            final_effective_model=response_model or actual_model,
+            completion_outcome=completion_outcome,
+            rollover_occurred=rollover_occurred,
+            rollover_parent_session_id=rollover_parent,
+            rollover_child_session_id=rollover_child,
+            rollover_reason=rollover_reason,
+        )
+
     async def _dmbl_load_history(self, session_key: Optional[str]) -> tuple:
         """Read-only view of the session transcript + rough token estimate.
         Returns ([], None) when unknown. Never mutates the transcript."""
@@ -26079,8 +26583,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _turn = getattr(self, "_dmbl_turn", None)
         if _turn is None:
             _turn = self._dmbl_turn = {"prompt": _text, "has_image": _has_image}
+        _turn["requested_decision"] = _decision
         _turn["decision"] = _decision
         _turn["session_key"] = _sk
+        _turn["route_receipt"] = await self._dmbl_build_receipt_context(
+            event=event,
+            source=source,
+            session_key=_sk,
+            decision=_decision,
+            mode=_mode,
+            pin_model=_pin_model,
+            pin_provider=_pin_provider,
+            route_armed=route_armed,
+        )
         # Session-keyed stash: concurrent turns from other chats/topics must
         # not read each other's decision (the resolver looks up by session key).
         _turns = getattr(self, "_dmbl_turns", None)
@@ -26192,6 +26707,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             _code = type(_exc).__name__
+            self._dmbl_add_receipt_attempt(
+                turn,
+                provider=decision.provider or "ollama",
+                model=decision.model,
+                transport="local_preflight",
+                outcome="failed",
+                local_invocation=False,
+                error_class=_code,
+            )
             logger.warning(
                 "Dumbledore %s preflight failed (%s): %s", decision.route, _code, _exc,
             )
@@ -26199,6 +26723,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _fb = _dcap.cloud_fallback_decision(decision, _code)
             except _dcap.LocalOnlyViolation:
                 turn["decision"] = None
+                turn["route_fallback_reason"] = f"local_only:{_code}"
                 self._dmbl_coder_failed = True
                 self._dmbl_coder_failed_text = (
                     f"⚠️ Local-only execution was required but {decision.model} could "
@@ -26211,6 +26736,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             turn["decision"] = _fb
+            turn["route_fallback_reason"] = _fb.reason.reason_code
             _dcap.log_route_event(
                 route=_fb.route, reason_code=_fb.reason.reason_code, model=_fb.model,
                 provider=_fb.provider, dispatch="agent", fallback=decision.route,
@@ -26219,6 +26745,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except _dcap.LocalLoadError as _exc:
             _code = type(_exc).__name__
+            self._dmbl_add_receipt_attempt(
+                turn,
+                provider=decision.provider or "ollama",
+                model=decision.model,
+                transport="local_preflight",
+                outcome="failed",
+                local_invocation=False,
+                error_class=_code,
+            )
             logger.warning(
                 "Dumbledore %s preflight failed (%s): %s", decision.route, _code, _exc,
             )
@@ -26226,6 +26761,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _fb = _dcap.cloud_fallback_decision(decision, _code)
             except _dcap.LocalOnlyViolation:
                 turn["decision"] = None
+                turn["route_fallback_reason"] = f"local_only:{_code}"
                 self._dmbl_coder_failed = True
                 self._dmbl_coder_failed_text = (
                     f"⚠️ Local-only execution was required but {decision.model} could "
@@ -26238,6 +26774,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             turn["decision"] = _fb
+            turn["route_fallback_reason"] = _fb.reason.reason_code
             _dcap.log_route_event(
                 route=_fb.route, reason_code=_fb.reason.reason_code, model=_fb.model,
                 provider=_fb.provider, dispatch="agent", fallback=decision.route,
@@ -26347,6 +26884,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 governance=_governance, previous_failures=_failures,
             )
             _t0 = time.time()
+            _local_invocation_started = [False]
 
             def _job(_dec=_dec, _pack=_pack):
                 with _dcap.AcceleratorLock().acquire(
@@ -26359,6 +26897,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         keep_alive=(_dec.keep_alive if _dec.keep_alive else "5m"),
                         exclusive=True, stop_comfy=True,
                     )
+                    _local_invocation_started[0] = True
                     _out = _dcap.run_specialist(
                         _dec.model, _pack, route=_dec.route, keep_alive=_dec.keep_alive,
                     )
@@ -26369,10 +26908,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _out["lock"] = _lk.result
                     return _out
 
+            _receipt_attempt = self._dmbl_add_receipt_attempt(
+                turn,
+                provider="ollama",
+                model=_dec.model,
+                transport="direct_ollama",
+                outcome="started",
+                retry_index=_idx,
+                local_invocation=False,
+                fallback_reason_code=(
+                    _failure_codes[-1] if _idx > 0 and _failure_codes else None
+                ),
+                fallback_from_model=(decision.model if _idx > 0 else None),
+                fallback_from_provider=("ollama" if _idx > 0 else None),
+            )
             try:
                 _out = await self._run_in_executor_with_context(_job)
+            except asyncio.CancelledError:
+                if _receipt_attempt is not None:
+                    _receipt_attempt["outcome"] = "cancelled"
+                    _receipt_attempt["error_class"] = "CancelledError"
+                    _receipt_attempt["local_invocation"] = bool(
+                        _local_invocation_started[0]
+                    )
+                try:
+                    await self._dmbl_finalize_route_receipt(
+                        turn,
+                        actual_provider=(
+                            "ollama" if _local_invocation_started[0] else None
+                        ),
+                        actual_model=(
+                            _dec.model if _local_invocation_started[0] else None
+                        ),
+                        completion_outcome="cancelled",
+                    )
+                except Exception as _cancel_receipt_exc:
+                    logger.debug(
+                        "Dumbledore cancelled specialist receipt skipped: %s",
+                        _cancel_receipt_exc,
+                    )
+                raise
             except Exception as _exc:
                 _code = type(_exc).__name__
+                if _receipt_attempt is not None:
+                    _receipt_attempt["outcome"] = "failed"
+                    _receipt_attempt["error_class"] = _code
+                    _receipt_attempt["local_invocation"] = bool(
+                        _local_invocation_started[0]
+                    )
                 _failure_codes.append(_code)
                 _failures.append(f"{_dec.route} ({_dec.model}) failed: {_code}: {str(_exc)[:160]}")
                 _dcap.log_route_event(
@@ -26386,6 +26969,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _dec.route, time.time() - _t0, _exc,
                 )
                 continue
+            if _receipt_attempt is not None:
+                _receipt_attempt["outcome"] = "returned"
+                _receipt_attempt["local_invocation"] = True
+                _receipt_attempt["provider"] = str(_out.get("provider") or "ollama")[:200]
+                _receipt_attempt["response_model"] = str(
+                    _out.get("response_model") or _dec.model
+                )[:200]
             _dcap.log_route_event(
                 route=_dec.route, reason_code=_dec.reason.reason_code, model=_dec.model,
                 dispatch="specialist", previous_loaded=_out.get("previous_loaded"),
@@ -26407,6 +26997,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _reply = _dcap.mark_specialist_result(_reply)
             await _send(_reply + _dcap.route_signature(_dec))
             await self._dmbl_persist_specialist_exchange(session_key, event, _reply)
+            await self._dmbl_finalize_route_receipt(
+                turn,
+                actual_provider=_out.get("provider") or "ollama",
+                actual_model=_dec.model,
+                response_model=_out.get("response_model") or _dec.model,
+                completion_outcome="completed",
+            )
             return True
 
         # Every local lane failed -> CLOUD_SAFE via the tool-capable agent loop.
@@ -26425,8 +27022,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "⚠️ Local-only execution was required and every local lane failed; "
                 "no cloud fallback was used:\n" + "\n".join(f"- {f}" for f in _failures)
             )
+            if turn is not None:
+                turn["route_fallback_reason"] = (
+                    _failure_codes[-1] if _failure_codes else "unknown"
+                )
+            await self._dmbl_finalize_route_receipt(
+                turn,
+                actual_provider=None,
+                actual_model=None,
+                completion_outcome="local_only_failed",
+            )
             return True
         (turn if turn is not None else self._dmbl_turn)["decision"] = _fb
+        if turn is not None:
+            turn["route_fallback_reason"] = _fb.reason.reason_code
         self._dmbl_coder_failed = True
         self._dmbl_coder_failed_text = _fb.notice + "\n" + "\n".join(f"- {f}" for f in _failures)
         _dcap.log_route_event(
@@ -31560,19 +32169,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
-                )
+                _queued_receipt_turn = None
+                try:
+                    _queued_receipt_turn = await self._dmbl_transition_queued_route_receipt(
+                        current_session_key=session_key,
+                        current_agent_result=(
+                            response if isinstance(response, dict) else result
+                        ),
+                        queued_event=pending_event,
+                        queued_message=next_message or "",
+                        queued_message_id=next_message_id,
+                        queued_source=next_source,
+                        queued_session_key=next_session_key,
+                        run_generation=run_generation,
+                    )
+                except Exception as _queued_receipt_exc:
+                    logger.debug(
+                        "Dumbledore queued route receipt transition skipped: %s",
+                        _queued_receipt_exc,
+                    )
+
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                    )
+                except BaseException as _queued_turn_exc:
+                    try:
+                        await self._dmbl_finalize_route_receipt(
+                            _queued_receipt_turn,
+                            completion_outcome=(
+                                "cancelled"
+                                if isinstance(_queued_turn_exc, asyncio.CancelledError)
+                                else "rejected_or_gateway_error"
+                            ),
+                            run_generation=run_generation,
+                        )
+                    except Exception as _queued_terminal_receipt_exc:
+                        logger.debug(
+                            "Dumbledore queued terminal receipt skipped: %s",
+                            _queued_terminal_receipt_exc,
+                        )
+                    raise
+                try:
+                    await self._dmbl_finalize_route_receipt(
+                        _queued_receipt_turn,
+                        agent_result=(
+                            followup_result if isinstance(followup_result, dict) else None
+                        ),
+                        effective_session_id=(
+                            followup_result.get("session_id")
+                            if isinstance(followup_result, dict)
+                            else None
+                        ),
+                        run_generation=run_generation,
+                        agent_turn_id=(
+                            followup_result.get("route_provenance_turn_id")
+                            if isinstance(followup_result, dict)
+                            else None
+                        ),
+                    )
+                except Exception as _queued_complete_receipt_exc:
+                    logger.debug(
+                        "Dumbledore queued completion receipt skipped: %s",
+                        _queued_complete_receipt_exc,
+                    )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

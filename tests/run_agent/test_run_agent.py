@@ -53,6 +53,32 @@ def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
 
+def test_route_provenance_remote_custom_provider_is_not_local():
+    from agent.conversation_loop import _route_provenance_local
+
+    remote = SimpleNamespace(
+        provider="custom:remote-https",
+        # A remote compatible server may deliberately expose the same alias as
+        # the local Ollama lane; the model name alone is not locality proof.
+        model="qwen3.5:9b-131k-fleet",
+        base_url="https://api.example.com/v1",
+    )
+    misleading_host = SimpleNamespace(
+        provider="custom",
+        model="vendor/remote-model",
+        base_url="https://localhost.attacker.example/v1",
+    )
+    loopback = SimpleNamespace(
+        provider="custom:local-openai-compatible",
+        model="vendor/local-model",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+
+    assert _route_provenance_local(remote) is False
+    assert _route_provenance_local(misleading_host) is False
+    assert _route_provenance_local(loopback) is True
+
+
 
 
 
@@ -5127,6 +5153,16 @@ class TestRetryExhaustion:
         }
         assert len(request_ids) == 1
         assert logical_completions == [(request_ids.pop(), "success")]
+        provenance = agent._route_provenance_attempts
+        assert [attempt["ordinal"] for attempt in provenance] == [1, 2]
+        assert [attempt["retry_index"] for attempt in provenance] == [0, 1]
+        assert len({attempt["api_request_id"] for attempt in provenance}) == 1
+        assert [attempt["outcome"] for attempt in provenance] == [
+            "invalid_response",
+            "returned",
+        ]
+        assert provenance[0]["error_class"] == "InvalidResponse"
+        assert all("messages" not in attempt and "prompt" not in attempt for attempt in provenance)
 
     def test_content_filter_refusal_surfaced_not_retried(self, agent):
         """A model refusal must be surfaced immediately, NOT laundered into
@@ -5795,6 +5831,12 @@ class TestFallbackAnthropicProvider:
         assert agent.api_mode == "anthropic_messages"
         assert agent._anthropic_client is not None
         assert agent.client is None
+        transition = agent._route_provenance_fallbacks[-1]
+        assert transition["from_model"] != transition["to_model"]
+        assert transition["to_model"] == "claude-sonnet-4-20250514"
+        assert transition["to_provider"] == "anthropic"
+        assert transition["reason_code"] == "unknown"
+        assert "api_key" not in transition and "base_url" not in transition
 
     def test_fallback_to_anthropic_enables_prompt_caching(self, agent):
         agent._fallback_activated = False

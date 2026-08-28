@@ -9,7 +9,18 @@ metadata:
   hermes:
     tags: [code-review, security, verification, quality, pre-commit, auto-fix]
     related_skills: [subagent-driven-development, plan, test-driven-development, github-code-review]
+    governance_status: SUPERSEDED
+    authority_status: REFERENCE_ONLY
+    superseded_by: /home/qws/.hermes/skills/software-development/requesting-code-review/SKILL.md
 ---
+
+> **STOP — SUPERSEDED / REFERENCE_ONLY**
+>
+> Do not execute this v2.0 workflow. Its auto-launch and auto-fix behavior is
+> noncontrolling. The canonical Dumbledore v2.1 skill is
+> `/home/qws/.hermes/skills/software-development/requesting-code-review/SKILL.md`.
+> Named Independent Review remains Chairman-explicit under the Fleet Protocol
+> Registry. The body below is preserved as historical reference only.
 
 # Pre-Commit Code Verification
 

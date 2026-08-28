@@ -2,9 +2,19 @@
 title: "Requesting Code Review — Pre-commit review: security scan, quality gates, auto-fix"
 sidebar_label: "Requesting Code Review"
 description: "Pre-commit review: security scan, quality gates, auto-fix"
+governance_status: "SUPERSEDED"
+authority_status: "REFERENCE_ONLY"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+:::warning Superseded reference
+This generated v2.0 page is `SUPERSEDED` and `REFERENCE_ONLY`; do not execute
+its auto-launch, auto-fix, or commit workflow. Dumbledore's current v2.1 skill
+is `/home/qws/.hermes/skills/software-development/requesting-code-review/SKILL.md`.
+Named Independent Review remains Chairman-explicit under the Fleet Protocol
+Registry. The generated body below is preserved as historical reference.
+:::
 
 # Requesting Code Review
 

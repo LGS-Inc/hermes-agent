@@ -6,6 +6,7 @@ inference) stubbed at the module boundary of ``agent.dumbledore_capability_route
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -87,6 +88,15 @@ def _telemetry(tmp_path):
     return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
 
 
+def _receipts(tmp_path):
+    return [
+        event
+        for event in _telemetry(tmp_path)
+        if event.get("v") == cap.ROUTE_RECEIPT_VERSION
+        and event.get("kind") == cap.ROUTE_RECEIPT_KIND
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -165,7 +175,8 @@ async def test_R6_code_fast_dispatch(env):
     await runner._handle_message(_event("Write a function that reverses a string in python"))
     model, route, keep_alive, _ = env["specialist"][-1]
     assert model == cap.CODE_FAST_MODEL and route == cap.CODE_FAST and keep_alive == "5m"
-    assert _sent(adapter)[-1] == "qwen2.5-coder:14b says hi"
+    assert _sent(adapter)[-1].endswith("qwen2.5-coder:14b says hi")
+    assert cap.SPECIALIST_RESULT_BOUNDARY in _sent(adapter)[-1]
 
 
 @pytest.mark.asyncio
@@ -584,3 +595,837 @@ def test_turn_runner_agent_path_applies_session_keyed_decision(tmp_path, monkeyp
                                                   "decision": decision}}
     tk._run_turn(runner, "what time is it?")
     assert tk._CapturingAgent.init_calls[-1]["model"] == cap.DEEP_LOCAL_MODEL
+
+
+def test_RP_agent_result_exports_actual_provider_turn_and_attempts(tmp_path, monkeypatch):
+    from tests.gateway import test_dumbledore_attachment_toolsets as tk
+
+    runner = tk._runner()
+    tk._configure(monkeypatch, tmp_path)
+
+    def _run(self, user_message, conversation_history=None, task_id=None):
+        self.model = cap.CLOUD_SAFE_MODEL
+        self.provider = cap.CLOUD_SAFE_PROVIDER
+        self._current_turn_id = "raw-core-turn"
+        self._route_provenance_attempts = [
+            {
+                "ordinal": 1,
+                "api_request_id": "raw-core-api",
+                "retry_index": 0,
+                "provider": cap.CLOUD_SAFE_PROVIDER,
+                "model": cap.CLOUD_SAFE_MODEL,
+                "transport": "agent",
+                "local_invocation": False,
+                "outcome": "returned",
+            }
+        ]
+        self._route_provenance_fallbacks = []
+        self._route_provenance_attempts_truncated = 0
+        return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    monkeypatch.setattr(tk._CapturingAgent, "run_conversation", _run)
+    result = tk._run_turn(runner, "hello", session_id="session-provenance")
+    assert result["model"] == cap.CLOUD_SAFE_MODEL
+    assert result["provider"] == cap.CLOUD_SAFE_PROVIDER
+    assert result["route_provenance_turn_id"] == "raw-core-turn"
+    assert result["route_provenance_attempts"][0]["api_request_id"] == "raw-core-api"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "expected_route", "local"),
+    [
+        ("what time is it?", cap.HOME_FAST, True),
+        (
+            "Design a fault-tolerant architecture and compare the trade-offs",
+            cap.DEEP_LOCAL,
+            True,
+        ),
+        ("switch to the cloud and summarize the document", cap.CLOUD_SAFE, False),
+    ],
+)
+async def test_RP1_RP2_RP5_agent_success_receipts(
+    env, tmp_path, prompt, expected_route, local
+):
+    runner, _adapter = _gw()
+    event = _event(prompt)
+    event.message_id = f"rp-agent-{expected_route}"
+    session_key = runner._session_key_for_source(event.source)
+    decision = cap.decide_route(prompt)
+    assert decision.route == expected_route
+    receipt = await runner._dmbl_build_receipt_context(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        decision=decision,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    receipt["input_session_id"] = "session-agent"
+    turn = {
+        "requested_decision": decision,
+        "decision": decision,
+        "route_receipt": receipt,
+    }
+    provider = decision.provider or "ollama"
+    result = {
+        "provider": provider,
+        "model": decision.model,
+        "session_id": "session-agent",
+        "final_response": "ok",
+        "completed": True,
+        "route_provenance_turn_id": f"turn-{expected_route}",
+        "route_provenance_attempts": [
+            {
+                "ordinal": 1,
+                "api_request_id": f"api-{expected_route}",
+                "retry_index": 0,
+                "provider": provider,
+                "model": decision.model,
+                "response_model": decision.model,
+                "transport": "agent",
+                "local_invocation": local,
+                "outcome": "returned",
+            }
+        ],
+    }
+    await runner._dmbl_finalize_route_receipt(turn, agent_result=result)
+
+    rec = _receipts(tmp_path)[-1]
+    assert rec["requested_route"] == expected_route
+    assert rec["requested_model"] == decision.model
+    assert rec["actual_model"] == decision.model
+    assert rec["final_effective_model"] == decision.model
+    assert rec["local_invocation"] is local
+    assert rec["cloud_fallback"] is False
+    assert rec["completion_outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "expected_route", "expected_model"),
+    [
+        ("Write a function that reverses a string in python", cap.CODE_FAST, cap.CODE_FAST_MODEL),
+        (
+            "Refactor the whole codebase to replace requests with httpx across every module",
+            cap.CODE_HEAVY,
+            cap.CODE_HEAVY_MODEL,
+        ),
+    ],
+)
+async def test_RP3_RP4_direct_specialist_receipts(
+    env, tmp_path, prompt, expected_route, expected_model
+):
+    runner, _adapter = _gw()
+    event = _event(prompt)
+    event.message_id = f"rp-specialist-{expected_route}"
+    await runner._handle_message(event)
+
+    receipts = _receipts(tmp_path)
+    assert len(receipts) == 1
+    rec = receipts[0]
+    assert rec["requested_route"] == expected_route
+    assert rec["requested_model"] == expected_model
+    assert rec["actual_provider"] == "ollama"
+    assert rec["actual_model"] == expected_model
+    assert rec["local_invocation"] is True
+    assert rec["cloud_fallback"] is False
+    assert rec["attempts"][-1]["transport"] == "direct_ollama"
+    assert rec["attempts"][-1]["outcome"] == "returned"
+
+
+@pytest.mark.asyncio
+async def test_RP6_local_failure_receipt_preserves_request_and_cloud_actual(env, tmp_path):
+    runner, _adapter = _gw()
+    event = _event("what time is it?")
+    event.message_id = "rp-local-fallback"
+    session_key = runner._session_key_for_source(event.source)
+    requested = cap.decide_route(event.text)
+    cloud = cap.cloud_fallback_decision(requested, "LocalLoadError")
+    receipt = await runner._dmbl_build_receipt_context(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        decision=requested,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    receipt["input_session_id"] = "session-fallback"
+    turn = {
+        "requested_decision": requested,
+        "decision": cloud,
+        "route_receipt": receipt,
+        "route_fallback_reason": cloud.reason.reason_code,
+    }
+    runner._dmbl_add_receipt_attempt(
+        turn,
+        provider=requested.provider,
+        model=requested.model,
+        transport="local_preflight",
+        outcome="failed",
+        local_invocation=False,
+        error_class="LocalLoadError",
+    )
+    await runner._dmbl_finalize_route_receipt(
+        turn,
+        agent_result={
+            "provider": cap.CLOUD_SAFE_PROVIDER,
+            "model": cap.CLOUD_SAFE_MODEL,
+            "session_id": "session-fallback",
+            "final_response": "cloud answer",
+            "completed": True,
+            "route_provenance_attempts": [
+                {
+                    "ordinal": 1,
+                    "api_request_id": "cloud-api-1",
+                    "provider": cap.CLOUD_SAFE_PROVIDER,
+                    "model": cap.CLOUD_SAFE_MODEL,
+                    "response_model": cap.CLOUD_SAFE_MODEL,
+                    "transport": "agent",
+                    "local_invocation": False,
+                    "outcome": "returned",
+                    "fallback_reason_code": cloud.reason.reason_code,
+                    "fallback_from_model": requested.model,
+                    "fallback_from_provider": requested.provider,
+                }
+            ],
+        },
+    )
+    rec = _receipts(tmp_path)[-1]
+    assert rec["requested_route"] == cap.HOME_FAST
+    assert rec["requested_model"] == cap.HOME_FAST_MODEL
+    assert rec["actual_provider"] == cap.CLOUD_SAFE_PROVIDER
+    assert rec["actual_model"] == cap.CLOUD_SAFE_MODEL
+    assert rec["fallback_reason_code"].startswith("fallback:home_fast:")
+    assert rec["local_invocation"] is False
+    assert rec["cloud_fallback"] is True
+
+
+@pytest.mark.asyncio
+async def test_RP6_local_only_failure_never_claims_cloud_fallback(env, tmp_path):
+    runner, _adapter = _gw()
+    event = _event("what time is it?")
+    event.message_id = "rp-local-only-failure"
+    session_key = runner._session_key_for_source(event.source)
+    requested = cap.decide_route(event.text)
+    receipt = await runner._dmbl_build_receipt_context(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        decision=requested,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    receipt["input_session_id"] = "session-local-only"
+    turn = {
+        "requested_decision": requested,
+        "decision": None,
+        "route_receipt": receipt,
+        "route_fallback_reason": "local_only:LocalLoadError",
+    }
+    runner._dmbl_add_receipt_attempt(
+        turn,
+        provider=requested.provider,
+        model=requested.model,
+        transport="local_preflight",
+        outcome="failed",
+        local_invocation=False,
+        error_class="LocalLoadError",
+    )
+    await runner._dmbl_finalize_route_receipt(
+        turn,
+        completion_outcome="local_only_failed",
+        effective_session_id="session-local-only",
+    )
+
+    rec = _receipts(tmp_path)[-1]
+    assert rec["local_invocation"] is False
+    assert rec["cloud_fallback"] is False
+    assert rec["completion_outcome"] == "local_only_failed"
+
+
+@pytest.mark.asyncio
+async def test_RP7_RP8_pin_receipt_then_normal_router_receipt(env, tmp_path):
+    runner, _adapter = _gw()
+    source = _source()
+    session_key = runner._session_key_for_source(source)
+    pin_model = "gpt-5.6-terra"
+    pin_provider = "openai-codex"
+
+    pinned_event = _event("hello")
+    pinned_event.message_id = "rp-pin-active"
+    pinned = cap.decide_route(
+        pinned_event.text,
+        mode="pinned",
+        pinned_model=pin_model,
+        pinned_provider=pin_provider,
+    )
+    pinned_receipt = await runner._dmbl_build_receipt_context(
+        event=pinned_event,
+        source=source,
+        session_key=session_key,
+        decision=pinned,
+        mode="pinned",
+        pin_model=pin_model,
+        pin_provider=pin_provider,
+        route_armed=None,
+    )
+    pinned_receipt["input_session_id"] = "session-pin"
+    await runner._dmbl_finalize_route_receipt(
+        {
+            "requested_decision": pinned,
+            "decision": pinned,
+            "route_receipt": pinned_receipt,
+        },
+        agent_result={
+            "provider": pin_provider,
+            "model": pin_model,
+            "session_id": "session-pin",
+            "final_response": "pinned",
+            "completed": True,
+        },
+    )
+
+    normal_event = _event("hello")
+    normal_event.message_id = "rp-pin-removed"
+    normal = cap.decide_route(normal_event.text, mode="home")
+    normal_receipt = await runner._dmbl_build_receipt_context(
+        event=normal_event,
+        source=source,
+        session_key=session_key,
+        decision=normal,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    normal_receipt["input_session_id"] = "session-pin"
+    await runner._dmbl_finalize_route_receipt(
+        {
+            "requested_decision": normal,
+            "decision": normal,
+            "route_receipt": normal_receipt,
+        },
+        agent_result={
+            "provider": normal.provider,
+            "model": normal.model,
+            "session_id": "session-pin",
+            "final_response": "normal",
+            "completed": True,
+        },
+    )
+
+    first, second = _receipts(tmp_path)
+    assert first["requested_route"] == cap.EXPLICIT_PIN
+    assert first["override_type"] == "persistent_pin"
+    assert first["override_model"] == pin_model
+    assert first["pin_preserved"] is True
+    assert second["requested_route"] == cap.HOME_FAST
+    assert second["override_type"] == "none"
+    assert second["pin_preserved"] is False
+
+
+@pytest.mark.asyncio
+async def test_RP9_RP10_RP11_RP12_retry_rollover_telegram_and_single_receipt(
+    env, tmp_path, monkeypatch
+):
+    runner, _adapter = _gw()
+    entry = MagicMock(
+        session_id="child-session",
+        metadata={
+            "context_rollover": {
+                "source_session": "parent-session",
+                "reason": "oversized",
+            }
+        },
+    )
+    store = MagicMock()
+    store.lookup_by_session_key = AsyncMock(return_value=entry)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "async_session_store",
+        property(lambda self: store),
+    )
+
+    event = _event("what time is it?")
+    event.message_id = "telegram-private-message"
+    event.platform_update_id = 424242
+    session_key = runner._session_key_for_source(event.source)
+    requested = cap.decide_route(event.text)
+    receipt = await runner._dmbl_build_receipt_context(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        decision=requested,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    receipt["input_session_id"] = "parent-session"
+    turn = {
+        "requested_decision": requested,
+        "decision": requested,
+        "route_receipt": receipt,
+    }
+    result = {
+        "provider": cap.CLOUD_SAFE_PROVIDER,
+        "model": cap.CLOUD_SAFE_MODEL,
+        "session_id": "child-session",
+        "final_response": "recovered",
+        "completed": True,
+        "route_provenance_turn_id": "parent-session:task:turn-1",
+        "route_provenance_run_generation": 12,
+        "route_provenance_attempts": [
+            {
+                "ordinal": 1,
+                "api_request_id": "logical-api-1",
+                "retry_index": 0,
+                "provider": requested.provider,
+                "model": requested.model,
+                "transport": "agent",
+                "local_invocation": True,
+                "outcome": "error",
+                "error_class": "TimeoutError",
+            },
+            {
+                "ordinal": 2,
+                "api_request_id": "logical-api-1",
+                "retry_index": 1,
+                "provider": cap.CLOUD_SAFE_PROVIDER,
+                "model": cap.CLOUD_SAFE_MODEL,
+                "response_model": cap.CLOUD_SAFE_MODEL,
+                "transport": "agent",
+                "local_invocation": False,
+                "outcome": "returned",
+                "fallback_reason_code": "timeout",
+                "fallback_from_provider": requested.provider,
+                "fallback_from_model": requested.model,
+            },
+        ],
+        "route_provenance_fallbacks": [
+            {
+                "from_provider": requested.provider,
+                "from_model": requested.model,
+                "to_provider": cap.CLOUD_SAFE_PROVIDER,
+                "to_model": cap.CLOUD_SAFE_MODEL,
+                "reason_code": "timeout",
+            }
+        ],
+    }
+    await runner._dmbl_finalize_route_receipt(turn, agent_result=result)
+    await runner._dmbl_finalize_route_receipt(turn, agent_result=result)
+
+    receipts = _receipts(tmp_path)
+    assert len(receipts) == 1
+    rec = receipts[0]
+    assert [a["ordinal"] for a in rec["attempts"]] == [1, 2]
+    assert rec["attempts"][0]["api_request_sha256"] == rec["attempts"][1]["api_request_sha256"]
+    assert rec["fallback_reason_code"] == "timeout"
+    assert rec["actual_provider"] == cap.CLOUD_SAFE_PROVIDER
+    assert rec["final_effective_model"] == cap.CLOUD_SAFE_MODEL
+    assert rec["platform"] == "telegram"
+    assert rec["platform_message_sha256"] == cap.hash_route_identifier(event.message_id)
+    assert rec["platform_update_sha256"] == cap.hash_route_identifier(event.platform_update_id)
+    assert rec["input_session_sha256"] == cap.hash_route_identifier("parent-session")
+    assert rec["effective_session_sha256"] == cap.hash_route_identifier("child-session")
+    assert rec["agent_turn_sha256"] == cap.hash_route_identifier(
+        "parent-session:task:turn-1"
+    )
+    assert rec["rollover_occurred"] is True
+    assert rec["rollover_parent_sha256"] == cap.hash_route_identifier("parent-session")
+    assert rec["rollover_child_sha256"] == cap.hash_route_identifier("child-session")
+    assert rec["rollover_reason"] == "oversized"
+    serialized = json.dumps(rec)
+    assert event.message_id not in serialized
+    assert event.source.chat_id not in serialized
+
+
+@pytest.mark.asyncio
+async def test_RP10_persisted_rollover_stamp_does_not_relabel_later_child_turn(
+    env, tmp_path, monkeypatch
+):
+    runner, _adapter = _gw()
+    entry = MagicMock(
+        session_id="child-session",
+        metadata={
+            "context_rollover": {
+                "source_session": "parent-session",
+                "reason": "oversized",
+            }
+        },
+    )
+    store = MagicMock()
+    store.lookup_by_session_key = AsyncMock(return_value=entry)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "async_session_store",
+        property(lambda self: store),
+    )
+
+    event = _event("hello after rollover")
+    event.message_id = "post-rollover-child-turn"
+    session_key = runner._session_key_for_source(event.source)
+    requested = cap.decide_route(event.text)
+    receipt = await runner._dmbl_build_receipt_context(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        decision=requested,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    assert receipt["input_session_id"] == "child-session"
+    await runner._dmbl_finalize_route_receipt(
+        {
+            "requested_decision": requested,
+            "decision": requested,
+            "route_receipt": receipt,
+        },
+        agent_result={
+            "provider": requested.provider,
+            "model": requested.model,
+            "session_id": "child-session",
+            "final_response": "ok",
+            "completed": True,
+        },
+    )
+
+    rec = _receipts(tmp_path)[-1]
+    assert rec["rollover_occurred"] is False
+    assert "rollover_parent_sha256" not in rec
+    assert "rollover_child_sha256" not in rec
+    assert "rollover_reason" not in rec
+
+
+@pytest.mark.asyncio
+async def test_RP10_session_change_without_rollover_evidence_is_not_rollover(
+    env, tmp_path, monkeypatch
+):
+    runner, _adapter = _gw()
+    entry = MagicMock(session_id="reset-session", metadata={})
+    store = MagicMock()
+    store.lookup_by_session_key = AsyncMock(return_value=entry)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "async_session_store",
+        property(lambda self: store),
+    )
+
+    event = _event("first message after an idle reset")
+    event.message_id = "post-reset-message"
+    session_key = runner._session_key_for_source(event.source)
+    requested = cap.decide_route(event.text)
+    receipt = await runner._dmbl_build_receipt_context(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        decision=requested,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    receipt["input_session_id"] = "pre-reset-session"
+    await runner._dmbl_finalize_route_receipt(
+        {
+            "requested_decision": requested,
+            "decision": requested,
+            "route_receipt": receipt,
+        },
+        agent_result={
+            "provider": requested.provider,
+            "model": requested.model,
+            "session_id": "reset-session",
+            "final_response": "ok",
+            "completed": True,
+            "route_provenance_session_was_split": False,
+        },
+    )
+
+    rec = _receipts(tmp_path)[-1]
+    assert rec["input_session_sha256"] == cap.hash_route_identifier(
+        "pre-reset-session"
+    )
+    assert rec["effective_session_sha256"] == cap.hash_route_identifier(
+        "reset-session"
+    )
+    assert rec["rollover_occurred"] is False
+    assert "rollover_parent_sha256" not in rec
+    assert "rollover_child_sha256" not in rec
+    assert "rollover_reason" not in rec
+
+
+@pytest.mark.asyncio
+async def test_RP10_agent_compression_signal_records_rollover_without_store_stamp(
+    env, tmp_path, monkeypatch
+):
+    runner, _adapter = _gw()
+    entry = MagicMock(session_id="compressed-child", metadata={})
+    store = MagicMock()
+    store.lookup_by_session_key = AsyncMock(return_value=entry)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "async_session_store",
+        property(lambda self: store),
+    )
+
+    event = _event("continue after agent compression")
+    event.message_id = "agent-compression-message"
+    session_key = runner._session_key_for_source(event.source)
+    requested = cap.decide_route(event.text)
+    receipt = await runner._dmbl_build_receipt_context(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        decision=requested,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    receipt["input_session_id"] = "compression-parent"
+    await runner._dmbl_finalize_route_receipt(
+        {
+            "requested_decision": requested,
+            "decision": requested,
+            "route_receipt": receipt,
+        },
+        agent_result={
+            "provider": requested.provider,
+            "model": requested.model,
+            "session_id": "compressed-child",
+            "final_response": "ok",
+            "completed": True,
+            "route_provenance_session_was_split": True,
+        },
+    )
+
+    rec = _receipts(tmp_path)[-1]
+    assert rec["rollover_occurred"] is True
+    assert rec["rollover_parent_sha256"] == cap.hash_route_identifier(
+        "compression-parent"
+    )
+    assert rec["rollover_child_sha256"] == cap.hash_route_identifier(
+        "compressed-child"
+    )
+    assert rec["rollover_reason"] == "compression_split"
+
+
+@pytest.mark.asyncio
+async def test_RP6_remote_custom_fallback_is_cloud_not_local(env, tmp_path):
+    runner, _adapter = _gw()
+    event = _event("what time is it?")
+    event.message_id = "remote-custom-fallback"
+    session_key = runner._session_key_for_source(event.source)
+    requested = cap.decide_route(event.text)
+    receipt = await runner._dmbl_build_receipt_context(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        decision=requested,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    receipt["input_session_id"] = "remote-custom-session"
+    turn = {
+        "requested_decision": requested,
+        "decision": requested,
+        "route_receipt": receipt,
+        "route_fallback_reason": "timeout",
+    }
+    await runner._dmbl_finalize_route_receipt(
+        turn,
+        agent_result={
+            "provider": "custom:remote-https",
+            "model": cap.HOME_FAST_MODEL,
+            "session_id": "remote-custom-session",
+            "final_response": "remote answer",
+            "completed": True,
+            "route_provenance_attempts": [
+                {
+                    "ordinal": 1,
+                    "provider": "custom:remote-https",
+                    "model": cap.HOME_FAST_MODEL,
+                    "response_model": cap.HOME_FAST_MODEL,
+                    "transport": "agent",
+                    "local_invocation": False,
+                    "outcome": "returned",
+                    "fallback_reason_code": "timeout",
+                }
+            ],
+        },
+    )
+
+    rec = _receipts(tmp_path)[-1]
+    assert rec["actual_provider"] == "custom:remote-https"
+    assert rec["local_invocation"] is False
+    assert rec["cloud_fallback"] is True
+
+
+@pytest.mark.asyncio
+async def test_RP12_queued_turns_get_separate_correlated_receipts(env, tmp_path):
+    runner, _adapter = _gw()
+    first_event = _event("first queued-chain message")
+    first_event.message_id = "queue-message-one"
+    second_event = _event("second queued-chain message")
+    second_event.message_id = "queue-message-two"
+    session_key = runner._session_key_for_source(first_event.source)
+    decision = cap.decide_route(first_event.text)
+    first_receipt = await runner._dmbl_build_receipt_context(
+        event=first_event,
+        source=first_event.source,
+        session_key=session_key,
+        decision=decision,
+        mode="home",
+        pin_model=None,
+        pin_provider=None,
+        route_armed=None,
+    )
+    first_receipt["input_session_id"] = "queue-session"
+    first_turn = {
+        "requested_decision": decision,
+        "decision": decision,
+        "session_key": session_key,
+        "route_receipt": first_receipt,
+    }
+    runner._dmbl_turns = {session_key: first_turn}
+    first_result = {
+        "provider": decision.provider,
+        "model": decision.model,
+        "session_id": "queue-session",
+        "final_response": "first answer",
+        "completed": True,
+        "route_provenance_turn_id": "queue-turn-one",
+        "route_provenance_attempts": [
+            {
+                "ordinal": 1,
+                "provider": decision.provider,
+                "model": decision.model,
+                "response_model": decision.model,
+                "transport": "agent",
+                "local_invocation": True,
+                "outcome": "returned",
+            }
+        ],
+    }
+
+    queued_turn = await runner._dmbl_transition_queued_route_receipt(
+        current_session_key=session_key,
+        current_agent_result=first_result,
+        queued_event=second_event,
+        queued_message=second_event.text,
+        queued_message_id=second_event.message_id,
+        queued_source=second_event.source,
+        queued_session_key=session_key,
+        run_generation=7,
+    )
+    assert queued_turn is runner._dmbl_turns[session_key]
+    assert queued_turn["decision"] is decision
+
+    second_result = {
+        "provider": decision.provider,
+        "model": decision.model,
+        "session_id": "queue-session",
+        "final_response": "second answer",
+        "completed": True,
+        "route_provenance_turn_id": "queue-turn-two",
+        "route_provenance_attempts": [
+            {
+                "ordinal": 1,
+                "provider": decision.provider,
+                "model": decision.model,
+                "response_model": decision.model,
+                "transport": "agent",
+                "local_invocation": True,
+                "outcome": "returned",
+            }
+        ],
+    }
+    await runner._dmbl_finalize_route_receipt(
+        queued_turn,
+        agent_result=second_result,
+        run_generation=7,
+    )
+
+    receipts = _receipts(tmp_path)
+    assert len(receipts) == 2
+    by_message = {rec["platform_message_sha256"]: rec for rec in receipts}
+    first = by_message[cap.hash_route_identifier(first_event.message_id)]
+    second = by_message[cap.hash_route_identifier(second_event.message_id)]
+    assert first["agent_turn_sha256"] == cap.hash_route_identifier("queue-turn-one")
+    assert second["agent_turn_sha256"] == cap.hash_route_identifier("queue-turn-two")
+    assert first["receipt_id"] != second["receipt_id"]
+
+    synthetic_first = await runner._dmbl_transition_queued_route_receipt(
+        current_session_key=session_key,
+        current_agent_result=second_result,
+        queued_event=None,
+        queued_message="repeated identifier-less queued text",
+        queued_message_id=None,
+        queued_source=second_event.source,
+        queued_session_key=session_key,
+        run_generation=7,
+    )
+    synthetic_first_result = {
+        "provider": decision.provider,
+        "model": decision.model,
+        "session_id": "queue-session",
+        "final_response": "third answer",
+        "completed": True,
+        "route_provenance_turn_id": "queue-turn-three",
+        "route_provenance_attempts": second_result["route_provenance_attempts"],
+    }
+    synthetic_second = await runner._dmbl_transition_queued_route_receipt(
+        current_session_key=session_key,
+        current_agent_result=synthetic_first_result,
+        queued_event=None,
+        queued_message="repeated identifier-less queued text",
+        queued_message_id=None,
+        queued_source=second_event.source,
+        queued_session_key=session_key,
+        run_generation=7,
+    )
+    assert synthetic_first is not None
+    assert synthetic_second is not None
+    assert (
+        synthetic_first["route_receipt"]["receipt_id"]
+        != synthetic_second["route_receipt"]["receipt_id"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_RP12_cancelled_direct_specialist_finalizes_receipt_then_reraises(
+    env, tmp_path, monkeypatch
+):
+    runner, _adapter = _gw()
+    event = _event("Write a function that reverses a string in python")
+    event.message_id = "cancelled-specialist-message"
+    monkeypatch.setattr(
+        runner,
+        "_run_in_executor_with_context",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._handle_message(event)
+
+    receipts = _receipts(tmp_path)
+    assert len(receipts) == 1
+    rec = receipts[0]
+    assert rec["platform_message_sha256"] == cap.hash_route_identifier(
+        event.message_id
+    )
+    assert rec["completion_outcome"] == "cancelled"
+    assert rec["attempts"][-1]["outcome"] == "cancelled"
+    assert rec["attempts"][-1]["error_class"] == "CancelledError"
