@@ -1725,7 +1725,15 @@ class TestExecuteToolCalls:
         agent._memory_manager = FakeMemoryManager()
         agent._memory_store = object()
 
-        with patch("tools.memory_tool.memory_tool", return_value=json.dumps({"success": True})):
+        with patch(
+            "tools.memory_tool.memory_tool",
+            return_value=json.dumps({
+                "success": True,
+                "noop": False,
+                "applied_operation_indexes": [0],
+                "noop_operation_indexes": [],
+            }),
+        ):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert len(calls) == 1
