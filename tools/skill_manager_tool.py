@@ -1507,11 +1507,34 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         return None
 
     try:
+        from tools.skill_provenance import get_current_write_origin
+
+        origin = str(get_current_write_origin() or "unknown")
+    except Exception:
+        origin = "unknown"
+    autonomous_origin = origin not in {"foreground", "assistant_tool"}
+
+    try:
         from tools import write_approval as wa
     except Exception:
-        return None  # fail open
+        if autonomous_origin:
+            return tool_error(
+                "Autonomous skill write refused because the approval gate was "
+                "unavailable. Nothing was changed.",
+                success=False,
+            )
+        return None
 
-    decision = wa.evaluate_gate(wa.SKILLS)
+    try:
+        decision = wa.evaluate_gate(wa.SKILLS)
+    except Exception:
+        if autonomous_origin:
+            return tool_error(
+                "Autonomous skill write refused because the approval decision "
+                "could not be evaluated. Nothing was changed.",
+                success=False,
+            )
+        raise
     if decision.allow:
         return None
     if decision.blocked:
@@ -1527,7 +1550,16 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         old_string=payload_kwargs.get("old_string") or "",
         new_string=payload_kwargs.get("new_string") or "",
     )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    try:
+        record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=origin)
+        persisted = wa.get_pending(wa.SKILLS, str(record.get("id") or ""))
+        if persisted is None:
+            raise OSError("pending skill record was not durably readable")
+    except Exception:
+        return tool_error(
+            "Skill proposal could not be staged for approval. Nothing was changed.",
+            success=False,
+        )
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "gist": gist, "message": decision.message},

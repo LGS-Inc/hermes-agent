@@ -438,6 +438,8 @@ async def maybe_rollover_before_compression(
         )
 
         # 1. Generate + persist the handoff FIRST. Failure → no rollover.
+        # The LLM-authored prose is followed by a deterministic machine block;
+        # rollover never attempts to infer protocol state from the prose.
         handoff = await asyncio.to_thread(
             generate_handoff_text,
             history,
@@ -448,6 +450,15 @@ async def maybe_rollover_before_compression(
             approx_tokens=approx_tokens,
             context_length=context_length,
         )
+        from gateway.named_protocol_state import (
+            METADATA_KEY as _PROTOCOL_STATE_KEY,
+            append_machine_state_block,
+            normalize_envelope,
+            rollover_metadata,
+        )
+
+        protocol_state = normalize_envelope(meta.get(_PROTOCOL_STATE_KEY))
+        handoff = append_machine_state_block(handoff, protocol_state)
         handoff_path = await asyncio.to_thread(
             persist_handoff, policy, old_sid, handoff
         )
@@ -465,8 +476,20 @@ async def maybe_rollover_before_compression(
             reasoning_override = dict(reasoning_override)
 
         # 3. Rotate — same primitive chain as /new and the
-        #    compression-exhausted reset (reset → evict → scope clear).
-        new_entry = await runner.async_session_store.reset_session(session_key)
+        #    compression-exhausted reset (reset → evict → scope clear). Only
+        #    validated named-protocol state and the rollover stamp cross this
+        #    boundary; unrelated metadata does not.
+        rollover_stamp = {
+            "at": time.time(),
+            "reason": reason,
+            "source_session": old_sid,
+            "handoff_path": handoff_path,
+        }
+        child_metadata = rollover_metadata(meta, rollover_stamp)
+        new_entry = await runner.async_session_store.reset_session(
+            session_key,
+            initial_metadata=child_metadata,
+        )
         if new_entry is None:
             raise RuntimeError("reset_session returned no new entry")
         runner._evict_cached_agent(session_key)
@@ -504,19 +527,12 @@ async def maybe_rollover_before_compression(
         except Exception:
             pass
 
-        # 7. Stamp metadata + guards so the fresh session cannot re-roll.
+        # 7. Stamp the process-local cooldown guard. The durable rollover stamp
+        #    and protocol envelope were written atomically with reset_session.
         _LAST_ROLLOVER[session_key] = time.monotonic()
-        try:
-            new_entry.metadata["context_rollover"] = {
-                "at": time.time(),
-                "reason": reason,
-                "source_session": old_sid,
-                "handoff_path": handoff_path,
-            }
-        except Exception:
-            pass
 
-        # 8. Inject the handoff into this very turn.
+        # 8. Inject the handoff into this very turn. The full-agent system
+        #    state remains authoritative over the free-form handoff prose.
         sidecar_notes.append(format_handoff_note(handoff))
 
         # 9. Brief user notice (optional).

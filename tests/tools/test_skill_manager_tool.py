@@ -442,22 +442,22 @@ class TestSkillManageDispatcher:
             set_current_write_origin,
         )
 
-        token = set_current_write_origin(BACKGROUND_REVIEW)
-        try:
-            with _skill_dir(tmp_path), \
-                 patch("tools.skill_usage.is_protected_builtin", return_value=False), \
-                 patch("tools.skill_usage.is_hub_installed", return_value=False), \
-                 patch("tools.skill_usage.is_bundled",
-                       side_effect=lambda skill_name: skill_name == "bundled"):
-                skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
-                skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT)
+        with _skill_dir(tmp_path), \
+             patch("tools.skill_usage.is_protected_builtin", return_value=False), \
+             patch("tools.skill_usage.is_hub_installed", return_value=False), \
+             patch("tools.skill_usage.is_bundled",
+                   side_effect=lambda skill_name: skill_name == "bundled"):
+            skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
+            skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT)
+            token = set_current_write_origin(BACKGROUND_REVIEW)
+            try:
                 raw = skill_manage(
                     action="delete",
                     name="bundled",
                     absorbed_into="umbrella",
                 )
-        finally:
-            reset_current_write_origin(token)
+            finally:
+                reset_current_write_origin(token)
 
         result = json.loads(raw)
         assert result["success"] is False

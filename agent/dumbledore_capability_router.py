@@ -147,6 +147,28 @@ COMFY_UNIT = "comfyui.service"
 
 ROUTE_SIGNATURE_ENV = "DUMBLEDORE_ROUTE_SIGNATURE"   # off by default
 
+# Direct specialists do not receive Dumbledore's full agent system prompt.
+# Keep this boundary short, deterministic, and identical for every specialist
+# model so routing never changes authority or named-protocol semantics.
+SPECIALIST_GOVERNANCE_BLOCK = (
+    "SPECIALIST GOVERNANCE BOUNDARY (DETERMINISTIC):\n"
+    "- You are advisory and task-scoped. Model selection grants no authority.\n"
+    "- Follow only the exact bounded task supplied by parent Dumbledore; do not "
+    "expand task scope.\n"
+    "- You cannot activate, close, pause, supersede, or alter Protocol Alpha, "
+    "Protocol OMEGA, FABLE Gate, or Independent Review. Any supplied protocol "
+    "context is read-only.\n"
+    "- You cannot authorize or perform write, deploy, send, delete, or "
+    "authenticate actions.\n"
+    "- Return evidence and proposed output only, never authority or approval.\n"
+    "- Parent Dumbledore and its runtime authorization gates remain authoritative "
+    "for scope, tools, mutation, acceptance, and deployment."
+)
+
+SPECIALIST_RESULT_BOUNDARY = (
+    "SPECIALIST RESULT — ADVISORY EVIDENCE / PROPOSED OUTPUT — NO AUTHORITY"
+)
+
 
 class LocalLoadError(RuntimeError):
     """Raised when a local model/service cannot be made resident in time."""
@@ -941,7 +963,7 @@ def build_specialist_context_pack(
 
 def specialist_system_prompt(model: str, route: str) -> str:
     if route in (CODE_FAST, CODE_HEAVY) or model in (CODE_FAST_MODEL, CODE_HEAVY_MODEL):
-        return (
+        role_prompt = (
             "You are the local coding specialist served through Ollama.\n\n"
             f"Your configured backend model identifier is exactly: {model}\n"
             "When asked which model you are, report that exact identifier.\n"
@@ -952,13 +974,28 @@ def specialist_system_prompt(model: str, route: str) -> str:
             "Prefer complete commands, patches, or replacement files.\n"
             "Separate findings, proposed changes, verification steps, and risks."
         )
-    return (
-        "You are Dumbledore's local deep-reasoning specialist served through Ollama.\n\n"
-        f"Your configured backend model identifier is exactly: {model}\n"
-        "You receive a bounded context pack, not the full conversation. Reason "
-        "carefully, state assumptions explicitly, separate evidence from inference, "
-        "and do not invent facts, files, or results."
-    )
+    else:
+        role_prompt = (
+            "You are Dumbledore's local deep-reasoning specialist served through Ollama.\n\n"
+            f"Your configured backend model identifier is exactly: {model}\n"
+            "You receive a bounded context pack, not the full conversation. Reason "
+            "carefully, state assumptions explicitly, separate evidence from inference, "
+            "and do not invent facts, files, or results."
+        )
+    return role_prompt + "\n\n" + SPECIALIST_GOVERNANCE_BLOCK
+
+
+def mark_specialist_result(content: Any) -> str:
+    """Return a specialist result with exactly one leading authority boundary.
+
+    The helper is pure and idempotent so delivery, fallback, and persistence
+    layers may all apply it without producing duplicate markers.
+    """
+    text = "" if content is None else str(content).strip()
+    marker = SPECIALIST_RESULT_BOUNDARY
+    while text == marker or text.startswith(marker + "\n"):
+        text = text[len(marker):].lstrip()
+    return marker if not text else marker + "\n\n" + text
 
 
 def run_specialist(

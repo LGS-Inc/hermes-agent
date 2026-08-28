@@ -16989,6 +16989,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        # Immutable authority evidence: capture the human-authored bytes before
+        # any pre-dispatch plugin can rewrite ``event.text``. Named-protocol
+        # state transitions are permitted to inspect only this value.
+        _immutable_chairman_text = getattr(event, "text", "") or ""
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -18352,7 +18356,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # never enter here. Returns True when the reply was delivered.
                 _dmbl_is_slash = (getattr(event, "text", "") or "").lstrip().startswith("/")
                 if _ctrl.kind == "none" and not _is_img_turn and not _dmbl_is_slash:
-                    if await self._dmbl_capability_dispatch(event, source, _route_armed):
+                    if await self._dmbl_capability_dispatch(
+                        event,
+                        source,
+                        _route_armed,
+                        immutable_chairman_text=_immutable_chairman_text,
+                    ):
                         return None
             except Exception as _dmbl_ctrl_exc:
                 logger.warning("Dumbledore control-word intercept skipped: %s", _dmbl_ctrl_exc)
@@ -19131,7 +19140,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
-                    event, source, _quick_key, _run_generation
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                    immutable_chairman_text=_immutable_chairman_text,
                 )
             except TurnLeaseTimeoutError as exc:
                 # This is a rejected message, not a completed agent turn. Return
@@ -19934,7 +19947,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(
+        self,
+        event,
+        source,
+        _quick_key: str,
+        run_generation: int,
+        *,
+        immutable_chairman_text: str = "",
+    ):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -20072,6 +20093,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        # Apply a verified Chairman directive only after final session routing
+        # is known, and before any model receives the turn. Plugin-rewritten
+        # text, handoff prose, history, and model output are never parsed.
+        _named_protocol_state = None
+        if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+            _named_protocol_state = await self._dmbl_apply_named_protocol_directive(
+                event=event,
+                source=source,
+                session_entry=session_entry,
+                immutable_chairman_text=immutable_chairman_text,
+            )
+
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -20147,6 +20180,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context_prompt = self._pinned_session_context_prompt(
             context, _redact_pii, session_key
         )
+        if os.environ.get("DUMBLEDORE_ROUTER") == "1":
+            from gateway.named_protocol_state import format_system_state_block
+
+            context_prompt = (
+                f"{context_prompt}\n\n"
+                f"{format_system_state_block(_named_protocol_state)}"
+            ).strip()
 
         # Per-turn must-deliver notes.  These used to be appended to
         # context_prompt (the ephemeral system prompt), which guaranteed a
@@ -25876,7 +25916,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return [], None
 
-    async def _dmbl_capability_dispatch(self, event, source, route_armed) -> bool:
+    def _dmbl_protocol_chairman_verified(
+        self,
+        event: Any,
+        source: Any,
+        session_key: Optional[str],
+    ) -> bool:
+        """Fail-closed proof for a Chairman-authored protocol directive.
+
+        This duplicates the private QFB gate's immutable identity boundary at
+        gateway ingress so a plugin, model, specialist, handoff, or other chat
+        can never create named-protocol state.
+        """
+        if bool(getattr(event, "internal", False)):
+            return False
+        if os.environ.get("DUMBLEDORE_ROUTER", "") != "1":
+            return False
+        platform = getattr(source, "platform", None)
+        platform_name = getattr(platform, "value", platform)
+        if str(platform_name or "").lower() != "telegram":
+            return False
+        if str(getattr(source, "chat_type", "") or "").lower() != "dm":
+            return False
+        if getattr(source, "thread_id", None) not in (None, ""):
+            return False
+        if str(getattr(source, "profile", None) or "default").lower() != "default":
+            return False
+        user_id = str(getattr(source, "user_id", "") or "")
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not user_id or user_id != chat_id:
+            return False
+        expected_key = f"agent:main:telegram:dm:{chat_id}"
+        if not session_key or session_key != expected_key:
+            return False
+        try:
+            import hashlib as _hashlib
+            import hmac as _hmac
+
+            cfg = _load_gateway_config()
+            settings = (
+                (((cfg.get("plugins") or {}).get("entries") or {}).get(
+                    "quantum-fleet-brain-bootstrap"
+                ) or {}).get("settings")
+                or {}
+            )
+            key_hash = str(settings.get("main_session_key_sha256") or "")
+            owner_hash = str(settings.get("chairman_telegram_id_sha256") or "")
+            if len(key_hash) != 64 or len(owner_hash) != 64:
+                return False
+            observed_key = _hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+            observed_owner = _hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+            return _hmac.compare_digest(observed_key, key_hash) and _hmac.compare_digest(
+                observed_owner, owner_hash
+            )
+        except Exception:
+            logger.warning(
+                "Named-protocol Chairman identity proof failed closed",
+                exc_info=True,
+            )
+            return False
+
+    async def _dmbl_apply_named_protocol_directive(
+        self,
+        *,
+        event: Any,
+        source: Any,
+        session_entry: Any,
+        immutable_chairman_text: str,
+    ) -> dict:
+        """Apply one explicit directive to durable session metadata.
+
+        The parser sees only the pre-plugin immutable message. Persistence is
+        completed before the returned state becomes authoritative.
+        """
+        from gateway.named_protocol_state import (
+            METADATA_KEY,
+            normalize_envelope,
+            transition_from_chairman_message,
+        )
+
+        metadata = getattr(session_entry, "metadata", None) or {}
+        current = normalize_envelope(metadata.get(METADATA_KEY))
+        verified = self._dmbl_protocol_chairman_verified(
+            event,
+            source,
+            getattr(session_entry, "session_key", None),
+        )
+        raw_message_id = getattr(event, "message_id", None)
+        message_id = str(raw_message_id) if raw_message_id not in (None, "") else None
+        transition = transition_from_chairman_message(
+            current,
+            immutable_chairman_text,
+            chairman_verified=verified,
+            activation_message_id=message_id,
+        )
+        if transition.changed:
+            persisted = await self.async_session_store.set_session_metadata(
+                session_entry.session_key,
+                METADATA_KEY,
+                transition.state,
+            )
+            if not persisted:
+                raise RuntimeError(
+                    "named protocol state could not be persisted; directive rejected"
+                )
+            logger.info(
+                "Named-protocol state transition persisted: reason=%s directive=%s",
+                transition.reason,
+                transition.directive.action if transition.directive else "none",
+            )
+        return transition.state
+
+    async def _dmbl_capability_dispatch(
+        self,
+        event,
+        source,
+        route_armed,
+        *,
+        immutable_chairman_text: str = "",
+    ) -> bool:
         """Capability-router turn entry (flag-gated by the caller, fail-safe).
 
         Returns True when the turn was fully handled (a specialist reply was
@@ -25935,6 +26093,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_sha8=(_hashlib.sha256(_sk.encode()).hexdigest()[:8] if _sk else None),
             pin_preserved=bool(_pin_model), outcome="decided",
         )
+        # A verified explicit named-protocol transition must be handled by the
+        # full governed agent path. Direct specialists are advisory and cannot
+        # create, close, pause, resume, supersede, or interpret runtime state.
+        from gateway.named_protocol_state import parse_chairman_directive
+
+        _protocol_directive = parse_chairman_directive(immutable_chairman_text)
+        if (
+            _protocol_directive is not None
+            and _decision.dispatch == "specialist"
+            and self._dmbl_protocol_chairman_verified(event, source, _sk)
+        ):
+            _turn["decision"] = None
+            _turn["named_protocol_directive"] = _protocol_directive.action
+            _dcap.log_route_event(
+                route=_decision.route,
+                reason_code=_decision.reason.reason_code,
+                model=_decision.model,
+                dispatch="agent",
+                outcome="named_protocol_full_agent_boundary",
+                prompt_sha8=_decision.reason.prompt_sha8,
+                pin_preserved=bool(_pin_model),
+            )
+            return False
         if _decision.route == _dcap.IMAGE_GENERATION:
             # Image orders are dispatched by the image lane above; reaching
             # here means that lane is disabled — fall back to ordinary handling
@@ -26124,8 +26305,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pinned=decision.reason.overrides_pin, local_only=decision.local_only,
                 explicit=decision.explicit,
             ))
+        from gateway.named_protocol_state import METADATA_KEY, format_system_state_block
+
+        _protocol_state = None
+        try:
+            _entry = (
+                await self.async_session_store.lookup_by_session_key(session_key)
+                if session_key
+                else None
+            )
+            _protocol_state = (
+                (getattr(_entry, "metadata", None) or {}).get(METADATA_KEY)
+                if _entry
+                else None
+            )
+        except Exception:
+            logger.debug(
+                "Dumbledore specialist protocol-state read failed closed",
+                exc_info=True,
+            )
         _governance = [
-            "Advisory reply only: you cannot write files, run commands, or call tools.",
+            _dcap.SPECIALIST_GOVERNANCE_BLOCK,
+            format_system_state_block(_protocol_state),
             "Do not claim to have run, tested, deployed, or verified anything.",
             "Never reveal credentials, secrets, or private fleet documents.",
         ]
@@ -26203,6 +26404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"⚠️ {decision.route} failed ({_failure_codes[-1]}); escalated to "
                     f"{_dec.route} ({_dec.model}).\n\n" + _reply
                 )
+            _reply = _dcap.mark_specialist_result(_reply)
             await _send(_reply + _dcap.route_signature(_dec))
             await self._dmbl_persist_specialist_exchange(session_key, event, _reply)
             return True

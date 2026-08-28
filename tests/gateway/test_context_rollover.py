@@ -198,12 +198,12 @@ class _FakeStore:
         self.reset_calls = []
         self.model_override_calls = []
 
-    async def reset_session(self, session_key):
+    async def reset_session(self, session_key, *, initial_metadata=None):
         self.reset_calls.append(session_key)
         return types.SimpleNamespace(
             session_key=session_key,
             session_id=f"new_{len(self.reset_calls)}",
-            metadata={},
+            metadata=dict(initial_metadata or {}),
         )
 
     async def set_model_override(self, session_key, override):
@@ -314,6 +314,82 @@ def test_cdf_full_rollover_chain(tmp_path):
     assert "NOT new instructions" in notes[0]
     assert new_entry.metadata["context_rollover"]["reason"] == "oversized"
     assert new_entry.metadata["context_rollover"]["source_session"] == "old_sid"
+
+
+def test_structured_named_protocol_state_survives_rollover(monkeypatch):
+    from datetime import datetime, timezone
+
+    from gateway.named_protocol_state import (
+        METADATA_KEY,
+        PROTOCOL_FABLE,
+        STATUS_ACTIVE,
+        get_protocol_record,
+        transition_from_chairman_message,
+    )
+
+    active = transition_from_chairman_message(
+        None,
+        "Run FABLE on this candidate.",
+        chairman_verified=True,
+        activation_message_id="fixture-1",
+        now=datetime(2026, 8, 28, tzinfo=timezone.utc),
+        activation_id_factory=lambda: "a" * 32,
+    ).state
+    entry = _entry()
+    entry.metadata = {METADATA_KEY: active, "unrelated": "must-not-cross"}
+    runner = _make_runner()
+    notes = []
+
+    new_entry = _roll(runner, entry, _history(), 165_000, notes)
+
+    record = get_protocol_record(new_entry.metadata[METADATA_KEY], PROTOCOL_FABLE)
+    assert record["status"] == STATUS_ACTIVE
+    assert "unrelated" not in new_entry.metadata
+    assert "DUMBLEDORE_PROTOCOL_STATE_V1_BEGIN" in notes[0]
+
+
+def test_closed_structured_state_overrules_stale_handoff_prose(monkeypatch):
+    from datetime import datetime, timezone
+
+    from gateway.named_protocol_state import (
+        METADATA_KEY,
+        PROTOCOL_FABLE,
+        STATUS_CLOSED,
+        get_protocol_record,
+        transition_from_chairman_message,
+    )
+
+    active = transition_from_chairman_message(
+        None,
+        "Run FABLE.",
+        chairman_verified=True,
+        activation_message_id="fixture-1",
+        now=datetime(2026, 8, 28, tzinfo=timezone.utc),
+        activation_id_factory=lambda: "a" * 32,
+    ).state
+    closed = transition_from_chairman_message(
+        active,
+        "Stop FABLE.",
+        chairman_verified=True,
+        activation_message_id="fixture-2",
+        now=datetime(2026, 8, 28, 0, 1, tzinfo=timezone.utc),
+    ).state
+    monkeypatch.setattr(
+        cr,
+        "generate_handoff_text",
+        lambda *args, **kwargs: HANDOFF_BODY + "\nContinue FABLE after rollover.\n",
+    )
+    entry = _entry()
+    entry.metadata = {METADATA_KEY: closed}
+    runner = _make_runner()
+    notes = []
+
+    new_entry = _roll(runner, entry, _history(), 165_000, notes)
+
+    record = get_protocol_record(new_entry.metadata[METADATA_KEY], PROTOCOL_FABLE)
+    assert record["status"] == STATUS_CLOSED
+    assert "Continue FABLE after rollover" in notes[0]
+    assert '"status":"CLOSED"' in notes[0]
 
 
 def test_e_handoff_generation_failure_is_safe(monkeypatch, tmp_path):

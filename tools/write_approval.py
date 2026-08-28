@@ -15,8 +15,8 @@ Both stores are written from two origins:
     turn and autonomously decides what to save (the source of the
     "wrong assumptions" users complained about)
 
-This module lets the user gate those writes per-subsystem with a boolean
-``write_approval``:
+This module lets the user gate ordinary foreground writes per-subsystem with a
+boolean ``write_approval``:
 
   * ``false`` (default) — write freely (the pre-gate behaviour)
   * ``true``            — require approval: do not commit the write; either
@@ -29,11 +29,13 @@ the gate stages BOTH to disk, but review affordances differ by subsystem
 (see ``hermes_cli`` slash handlers): memory shows full content, skills show
 metadata + a one-line gist + a ``diff`` escape hatch (CLI/dashboard/file).
 
-Staging is mandatory for background-origin writes (a daemon thread cannot
-block on an interactive prompt) and for gateway sessions (no inline prompt
-channel — review happens via ``/memory pending``). Foreground CLI memory
-writes prompt inline via the dangerous-command approval callback; skill
-writes always stage (too big to eyeball mid-loop).
+Autonomous skill writes always stage, independent of that optional config (a
+daemon thread cannot block on an interactive prompt and procedural guidance is
+durable system behavior). Governance-affecting autonomous memory is handled by
+the separate deterministic memory-governance gate. Foreground CLI memory
+writes prompt inline via the dangerous-command approval callback when the
+config gate is enabled; skill writes stage when gated because they are too big
+to eyeball mid-loop.
 
 Pending records live under ``<HERMES_HOME>/pending/{memory,skills}/<id>.json``
 so they survive process restarts and can be reviewed from CLI, gateway, or the
@@ -205,18 +207,19 @@ def pending_count(subsystem: str) -> int:
 # ---------------------------------------------------------------------------
 
 def current_origin() -> str:
-    """Return the active write origin: ``foreground`` or ``background_review``.
+    """Return the active write origin.
 
     Reuses the skill-provenance ContextVar, which the background review fork
     already sets (see ``agent.background_review`` /
     ``AIAgent._spawn_background_review``). Foreground agent turns leave it at
-    the default ``foreground``.
+    the default ``foreground``. An unavailable provenance source is ``unknown``
+    rather than foreground so autonomous write gates can fail closed.
     """
     try:
         from tools.skill_provenance import get_current_write_origin
         return get_current_write_origin()
     except Exception:
-        return "foreground"
+        return "unknown"
 
 
 def is_background() -> bool:
@@ -262,7 +265,8 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
             are small; skills never take the inline path).
 
     Decision matrix:
-        gate off (default)                    → allow (writes flow freely)
+        autonomous/unknown skill origin       → stage (independent of config)
+        gate off (default, other cases)       → allow (writes flow freely)
         gate on, memory + interactive CLI     → inline approve/deny prompt
         gate on, memory + gateway/script/bg   → stage
         gate on, skills (any origin)          → stage (too big to review inline)
@@ -271,10 +275,25 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
     delays a write for approval, never silently refuses it. ``blocked`` is
     still produced when the user *actively denies* an inline prompt.
     """
+    origin = current_origin()
+    background = origin == "background_review"
+    unknown_origin = origin not in {"foreground", "assistant_tool", "background_review"}
+
+    # Autonomous skill learning is always a proposal, independent of the
+    # optional config gate. This preserves normal background learning while
+    # preventing a missing/malformed config from silently turning it into
+    # durable system guidance. Unknown provenance takes the same safe path.
+    if subsystem == SKILLS and (background or unknown_origin):
+        return GateDecision(
+            stage=True,
+            message=(
+                "Staged for approval. Autonomous skill writes require explicit "
+                "approval and are not yet saved. Review with /skills pending."
+            ),
+        )
+
     if not write_approval_enabled(subsystem):
         return GateDecision(allow=True)
-
-    background = is_background()
 
     # Skills always stage — a SKILL.md is too large to review inline, and a
     # background skill write happens in a daemon thread with no user present.

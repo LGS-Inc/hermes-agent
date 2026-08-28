@@ -3072,13 +3072,31 @@ class SessionStore:
         (#85709), and a background write must not make an idle session look
         fresh.
         """
+        try:
+            encoded_value = json.dumps(value, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session metadata must be JSON-serializable") from exc
+        if len(encoded_value.encode("utf-8")) > 16_384:
+            raise ValueError("session metadata value exceeds the 16 KiB limit")
+
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
-            entry.metadata[key] = value
-            self._save()
+            # Persist a detached candidate before publishing it to the live
+            # entry. A failed disk/DB write therefore cannot leave a protocol
+            # transition visible only in process memory.
+            candidate_metadata = dict(entry.metadata)
+            candidate_metadata[key] = json.loads(encoded_value)
+            candidate_entry = entry.to_dict()
+            candidate_entry["metadata"] = candidate_metadata
+            self._save_entry(
+                session_key,
+                entry_data=candidate_entry,
+                lock_held=True,
+            )
+            entry.metadata = candidate_metadata
             return True
 
     def set_model_override(
@@ -3398,8 +3416,37 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
-        """Force reset a session, creating a new session ID."""
+    def reset_session(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+        *,
+        initial_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SessionEntry]:
+        """Force reset a session, creating a new session ID.
+
+        ``initial_metadata`` is an explicit, JSON-only continuity carrier for
+        small machine state that must cross a deliberate reset. It defaults to
+        empty so ordinary ``/new`` and ``/reset`` retain their existing clean
+        boundary. Callers must select and validate every carried key.
+        """
+        if initial_metadata is None:
+            prepared_metadata: Dict[str, Any] = {}
+        elif not isinstance(initial_metadata, dict):
+            raise ValueError("initial_metadata must be a dictionary")
+        else:
+            try:
+                encoded_metadata = json.dumps(
+                    initial_metadata, separators=(",", ":")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "initial_metadata must be JSON-serializable"
+                ) from exc
+            if len(encoded_metadata.encode("utf-8")) > 32_768:
+                raise ValueError("initial_metadata exceeds the 32 KiB limit")
+            prepared_metadata = json.loads(encoded_metadata)
+
         db_end_session_id = None
         db_create_kwargs = None
         new_entry = None
@@ -3425,6 +3472,7 @@ class SessionStore:
                 display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                metadata=prepared_metadata,
                 is_fresh_reset=True,
             )
 

@@ -1032,6 +1032,178 @@ def _normalize_memory_observability_context(
     }
 
 
+_TRUSTED_FOREGROUND_MEMORY_ORIGINS = frozenset({"foreground", "assistant_tool"})
+
+
+def _background_governance_candidate_texts(
+    action: Optional[str],
+    content: Optional[str],
+    old_text: Optional[str],
+    operations: Optional[List[Dict[str, Any]]],
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Return bounded classifier inputs, or a safe validation error.
+
+    The classifier sees both sides of replace/remove operations so autonomous
+    learning cannot erase or rewrite a governance-bearing entry by presenting
+    only a harmless replacement string.
+    """
+
+    texts: List[str] = []
+    if operations:
+        if not isinstance(operations, list):
+            return None, "operations must be a list of memory operations."
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, dict):
+                return None, f"Operation {index + 1} must be an object."
+            op_action = str(operation.get("action") or "")
+            if op_action not in {"add", "replace", "remove"}:
+                return None, f"Operation {index + 1} has an invalid action."
+            new_content = operation.get("content")
+            if new_content is None:
+                new_content = operation.get("new_text")
+            for value in (new_content, operation.get("old_text")):
+                if value is None:
+                    continue
+                if not isinstance(value, str):
+                    return None, f"Operation {index + 1} contains non-text memory content."
+                texts.append(value)
+    else:
+        if action not in {"add", "replace", "remove"}:
+            return [], None
+        for value in (content, old_text):
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                return None, "Memory content must be text."
+            texts.append(value)
+    return texts, None
+
+
+def _apply_background_governance_gate(
+    action: Optional[str],
+    target: str,
+    content: Optional[str],
+    old_text: Optional[str],
+    operations: Optional[List[Dict[str, Any]]] = None,
+    observability_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Stage autonomous governance learning independently of config.
+
+    Known foreground origins retain the existing memory policy. Background and
+    unknown origins are deterministically classified; governance-affecting or
+    unclassifiable candidates are staged for explicit approval. Any classifier
+    or staging failure blocks the write rather than falling through to disk.
+    """
+
+    try:
+        from tools.skill_provenance import get_current_write_origin
+
+        origin = str(get_current_write_origin() or "unknown")
+    except Exception:
+        origin = "unknown"
+    if origin in _TRUSTED_FOREGROUND_MEMORY_ORIGINS:
+        return None
+
+    texts, validation_error = _background_governance_candidate_texts(
+        action,
+        content,
+        old_text,
+        operations,
+    )
+    if validation_error:
+        return tool_error(
+            f"Autonomous memory write refused: {validation_error}",
+            success=False,
+        )
+    if not texts:
+        return None
+
+    # Staging must not become a bypass around the existing strict
+    # injection/secret scan. Scan every proposed string before persisting a
+    # pending record; a finding is rejected, never copied to the pending store.
+    for value in texts:
+        scan_error = _scan_memory_content(value)
+        if scan_error:
+            return tool_error(scan_error, success=False)
+
+    try:
+        from tools.memory_governance import classify_governance_texts
+
+        classification = classify_governance_texts(texts)
+    except Exception:
+        logger.warning(
+            "Autonomous memory governance classifier failed; write refused",
+            exc_info=True,
+        )
+        return tool_error(
+            "Autonomous memory write refused because governance classification "
+            "was unavailable. Nothing was saved.",
+            success=False,
+        )
+
+    if not classification.requires_review:
+        return None
+
+    payload: Dict[str, Any]
+    if operations:
+        payload = {
+            "action": "batch",
+            "target": target,
+            "operations": operations,
+        }
+    else:
+        payload = {
+            "action": action,
+            "target": target,
+            "content": content,
+            "old_text": old_text,
+        }
+    payload["observability_context"] = _normalize_memory_observability_context(
+        observability_context
+    )
+    payload["governance_review_required"] = True
+    payload["governance_reason_codes"] = list(classification.reason_codes)
+
+    try:
+        from tools import write_approval as wa
+
+        reasons = ",".join(classification.reason_codes) or "unclassified"
+        record = wa.stage_write(
+            wa.MEMORY,
+            payload,
+            summary=f"governance memory proposal ({reasons})",
+            origin=origin,
+        )
+        persisted = wa.get_pending(wa.MEMORY, str(record.get("id") or ""))
+        if persisted is None:
+            raise OSError("pending governance record was not durably readable")
+    except Exception:
+        logger.warning(
+            "Autonomous governance memory staging failed; write refused",
+            exc_info=True,
+        )
+        return tool_error(
+            "Autonomous governance memory proposal could not be staged. "
+            "Nothing was saved.",
+            success=False,
+        )
+
+    return json.dumps(
+        {
+            "success": True,
+            "staged": True,
+            "governance_review_required": True,
+            "governance_reason_codes": list(classification.reason_codes),
+            "pending_id": record["id"],
+            "message": (
+                "Governance-affecting memory proposal staged for explicit approval. "
+                "It has not been saved to durable memory."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
 def _apply_write_gate(
     action: str,
     target: str,
@@ -1237,6 +1409,16 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        governance_result = _apply_background_governance_gate(
+            "batch",
+            target,
+            None,
+            None,
+            operations,
+            observability_context,
+        )
+        if governance_result is not None:
+            return governance_result
         gate_result = _apply_batch_write_gate(
             target,
             operations,
@@ -1270,6 +1452,17 @@ def memory_tool(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
+
+    governance_result = _apply_background_governance_gate(
+        action,
+        target,
+        content,
+        old_text,
+        None,
+        observability_context,
+    )
+    if governance_result is not None:
+        return governance_result
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
