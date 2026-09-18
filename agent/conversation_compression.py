@@ -1184,6 +1184,89 @@ def _session_was_rotated_by_compression(session_db: Any, session_id: str) -> boo
     )
 
 
+def _deterministic_trim_to_fit(agent, messages):
+    """Drop the oldest messages so an un-summarisable conversation still fits.
+
+    Returns ``(trimmed_messages, note)`` when a trim was needed and is possible,
+    or ``(None, "")`` to leave the conversation untouched.
+
+    This is the no-LLM safety net for the case where summarisation cannot run
+    (no auxiliary provider, a quota cap, or a summariser too slow to finish).
+    Without it the oversized transcript is sent as-is and the serving backend
+    truncates it silently — on llama.cpp/Ollama that means the middle of the
+    conversation vanishes with no record. A deterministic tail window is lossy
+    too, but it is *reported*, it is reproducible, and it keeps the most recent
+    exchanges, which is what a chat turn actually depends on.
+
+    Deliberately conservative: it only acts when the transcript genuinely
+    exceeds the model's context window, never merely because it crossed the
+    compression threshold. It imposes no restriction on which models may be
+    used — an oversized turn that previously "worked" by silent truncation
+    still works, just honestly.
+    """
+    try:
+        compressor = getattr(agent, "context_compressor", None)
+        try:
+            limit = int(getattr(compressor, "context_length", 0) or 0) if compressor else 0
+        except (TypeError, ValueError):
+            limit = 0
+        if limit <= 0:
+            return None, ""
+        if not isinstance(messages, list) or len(messages) < 4:
+            return None, ""
+
+        current = estimate_messages_tokens_rough(messages)
+        # Room for the system prompt (tool schemas dominate it) and the reply.
+        # Measured system prompts on this build run ~30k tokens, so reserve a
+        # generous share of the window rather than a token-exact figure.
+        reserve = max(int(limit * 0.45), 8000)
+        budget = limit - reserve
+        if budget <= 0 or current <= budget:
+            return None, ""
+
+        # Keep the newest messages that fit, and start the kept window on a
+        # user message so role alternation stays valid.
+        kept: list = []
+        total = 0
+        for msg in reversed(messages):
+            t = estimate_messages_tokens_rough([msg])
+            if total + t > budget and kept:
+                break
+            kept.append(msg)
+            total += t
+        kept.reverse()
+        while kept and str((kept[0] or {}).get("role", "")).lower() != "user":
+            dropped_first = kept.pop(0)
+            total -= estimate_messages_tokens_rough([dropped_first])
+        if not kept:
+            return None, ""
+
+        dropped_count = len(messages) - len(kept)
+        if dropped_count <= 0:
+            return None, ""
+        dropped_tokens = max(current - total, 0)
+        note_text = (
+            f"[Context trimmed: {dropped_count} earlier message(s) "
+            f"(~{dropped_tokens:,} tokens) were dropped because this conversation "
+            f"exceeds the current model's {limit:,}-token context window and no "
+            f"summariser was available. The most recent exchanges are kept in full.]"
+        )
+        trimmed = [{"role": "user", "content": note_text}] + kept
+        logger.warning(
+            "context trim (no summariser): dropped %d of %d messages "
+            "(~%d tokens) to fit %s limit %d",
+            dropped_count, len(messages), dropped_tokens,
+            getattr(compressor, "model", "") or "model", limit,
+        )
+        return trimmed, (
+            f"Dropped the {dropped_count} oldest message(s) (~{dropped_tokens:,} tokens) "
+            f"so the conversation fits the model's {limit:,}-token window."
+        )
+    except Exception:
+        logger.debug("deterministic trim failed; leaving messages unchanged", exc_info=True)
+        return None, ""
+
+
 def _emit_compression_attempt_telemetry(
     agent: Any,
     *,
@@ -3258,6 +3341,34 @@ def compress_context(
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
+                # Summarisation is unavailable (no aux provider, quota cap, or it
+                # timed out). Leaving the transcript untouched hands an oversized
+                # request to the provider, and a local llama.cpp server silently
+                # drops whatever does not fit — lossy, unreported, and it looks to
+                # the operator like the local model "doesn't work". If the
+                # conversation genuinely cannot fit, trim deterministically
+                # instead and say exactly what was dropped.
+                _trimmed, _trim_note = _deterministic_trim_to_fit(agent, messages)
+                if _trimmed is not None:
+                    agent._last_compression_summary_warning = _err
+                    agent._emit_warning(
+                        f"⚠ Compression unavailable ({_err}). {_trim_note} "
+                        "The turn continues on the selected model. Run /new for a "
+                        "fresh session, or restore a summariser to keep the middle "
+                        "of the conversation."
+                    )
+                    _existing_sp = getattr(agent, "_cached_system_prompt", None)
+                    if not _existing_sp:
+                        _existing_sp = agent._build_system_prompt(system_message)
+                    _emit_compression_attempt_telemetry(
+                        agent,
+                        started_at=_attempt_started_at,
+                        commit_status="trimmed_no_summary",
+                        split_status="trimmed_no_summary",
+                        failure_class="summary_unavailable_trimmed",
+                    )
+                    messages[:] = _trimmed
+                    return messages, _existing_sp
                 if getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
                     agent._emit_warning(
