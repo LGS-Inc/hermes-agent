@@ -119,6 +119,37 @@ arm_redirect() {
   export HERMES_DESKTOP_USER_DATA_DIR="$WORK_ROOT/electron-user-data"
 }
 
+quit_installed_app() {
+  local installed_bin
+  installed_bin="$(find_installed_app)/Contents/MacOS/Hermes"
+  local quitting_pids app_pid
+  quitting_pids="$(osascript -l JavaScript -e 'ObjC.import("AppKit"); function run(args) {
+    const apps = $.NSWorkspace.sharedWorkspace.runningApplications;
+    const pids = [];
+    for (let i = 0; i < apps.count; i++) {
+      const app = apps.objectAtIndex(i);
+      if (app.executableURL && ObjC.unwrap(app.executableURL.path) === args[0]) {
+        pids.push(app.processIdentifier);
+        if (!app.terminate) throw new Error("normal Quit refused");
+      }
+    }
+    return pids.join("\n");
+  }' "$installed_bin")" || fail "installed app refused normal Quit; no smoke launch attempted"
+  # AppKit's terminated property is cached until its main run loop advances.
+  # Observe the captured OS PIDs instead, as the bundled driver already does.
+  while IFS= read -r app_pid; do
+    [ -n "$app_pid" ] || continue
+    for _ in $(seq 1 240); do
+      kill -0 "$app_pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    if kill -0 "$app_pid" 2>/dev/null; then
+      fail "installed app did not quit normally (pid $app_pid); no smoke launch attempted"
+    fi
+    ok "installed app quit normally (pid $app_pid)"
+  done <<< "$quitting_pids"
+}
+
 desktop_checkpoint() { # phase, expected commit, selected method
   source_build_env "$HERMES_E2E_NODE" "$ASSETS/source-desktop-smoke.mjs" \
     --root "$INSTALL_DIR" --home "$HERMES_HOME" --user-data "$HERMES_DESKTOP_USER_DATA_DIR" \
@@ -250,23 +281,7 @@ phase_install() {
   ok "installed app: $(find_installed_app)"
   # The bootstrap can leave its launched app running. Preserve that handoff,
   # then request normal Quit of only this installed binary before smoke owns it.
-  local installed_bin
-  installed_bin="$(find_installed_app)/Contents/MacOS/Hermes"
-  osascript -l JavaScript -e 'ObjC.import("AppKit"); function run(args) {
-    const apps = $.NSWorkspace.sharedWorkspace.runningApplications;
-    for (let i = 0; i < apps.count; i++) {
-      const app = apps.objectAtIndex(i);
-      if (app.executableURL && ObjC.unwrap(app.executableURL.path) === args[0]) {
-        if (!app.terminate) throw new Error("normal Quit refused");
-        // A historical app (v2026.7.1) that the bootstrap launched moments ago
-        // was seen not to finish quitting within 30s while its backend was
-        // still starting. Allow longer, but the quit must stay the normal one.
-        const deadline = Date.now() + 120000;
-        while (!app.terminated && Date.now() < deadline) delay(0.2);
-        if (!app.terminated) throw new Error("installed app did not quit normally");
-      }
-    }
-  }' "$installed_bin" || fail "installed app did not close normally; no smoke launch attempted"
+  quit_installed_app
   desktop_checkpoint old "$OLD_SHA" desktop-installer@latest
 }
 
@@ -428,6 +443,11 @@ PYEOF
     || fail "hermes --version failed after update"
   ok "hermes --version works post-update"
   preserve_after_upgrade
+  # A GUI update may relaunch outside Playwright's original process.
+  # Close that installed app normally before a fresh smoke owns its backend.
+  case "$UPDATE_METHOD" in
+    open-app-update|hermes-desktop-app-update) quit_installed_app ;;
+  esac
   desktop_checkpoint new "$TARGET_SHA" "$UPDATE_METHOD"
   step "PASS: $OLD_REF -> $TARGET_LABEL via $UPDATE_METHOD"
 }
