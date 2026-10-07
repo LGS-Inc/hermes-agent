@@ -255,6 +255,14 @@ function Set-GitRedirect {
 "@ | Set-Content -LiteralPath $gitCfg -Encoding ASCII
     $env:GIT_CONFIG_GLOBAL = $gitCfg
 
+    # Current source probes isolate global Git config. Keep the same transport
+    # redirect in this driver-owned install's local config so hardened probes
+    # still inspect serve.git, while remote.origin.url remains official.
+    if (Test-Path -LiteralPath (Join-Path $InstallDir '.git')) {
+        Invoke-Git @('-C', $InstallDir, 'config', '--local', '--replace-all', "url.$fileUrl.insteadOf", $RepoUrlHttps) | Out-Null
+        Invoke-Git @('-C', $InstallDir, 'config', '--local', '--add', "url.$fileUrl.insteadOf", $RepoUrlSsh) | Out-Null
+    }
+
     # check it worked
     $actualGitUrl = Invoke-Git @("-C", $RepoRoot, "remote", "get-url", "origin")
     Assert-True ($actualGitUrl -eq $fileUrl) "git URL redirect: origin resolves to '$actualGitUrl', expected '$fileUrl'."
@@ -397,18 +405,18 @@ function Save-InstallSideState([string]$Label) {
 function Test-HermesRuns([string]$Label) {
     Save-InstallSideState $Label
     $hermesExe = $null
+    $needsStartup = $Label -eq 'post-update'
     try {
         $hermesExe = Get-SourceHermes $InstallDir
     } catch {
-        # A pre-handoff release cannot complete inside `hermes update`: its
-        # update path reaches no retired-hook seam, so the update ends with the
-        # tree at HEAD and no published launcher. The NEXT ordinary startup
-        # completes it (hermes_bootstrap -> prepare_launch -> sync PM, publish
-        # launchers, re-exec). Drive that startup here, WITHOUT the lazy-install
-        # ban, and only when the launcher is missing -- so a healthy update is
-        # still judged by the strict checks below, and `--version` probes keep
-        # their ban: a probe must never complete an unfinished update.
-        Write-Host "  no published launcher yet; running the next ordinary startup (this is what completes a pre-handoff release)"
+        $needsStartup = $true
+    }
+    if ($needsStartup) {
+        # Old updaters can publish a launcher before dependency migration and
+        # the completion tail are settled. Drive the next ordinary startup,
+        # as the macOS driver does, before the strict read-only acceptance.
+        # Version probes below retain their lazy-install ban.
+        Write-Host "  running the next ordinary startup to complete source-update work"
         $startupHermes = Get-SourceHermesForStartup $InstallDir
         $startupLog = Join-Path $WorkRoot 'logs\post-update-startup.log'
         New-Item -ItemType Directory -Force -Path (Split-Path $startupLog) | Out-Null
