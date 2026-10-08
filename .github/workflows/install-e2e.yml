@@ -464,8 +464,13 @@ jobs:
           sparse-checkout-cone-mode: false
       - env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAGS: ${{ needs.pick-releases.outputs.tags }}
         run: |
           set -euo pipefail
+          if [ -z "$RELEASE_TAGS" ]; then
+            echo 'Release selection failed; no result matrix was generated. See Pick release tags.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # The repo's GITHUB_TOKEN shares one hourly API budget with every
           # other workflow; a busy hour answered "API rate limit exceeded for
           # installation" and turned a green matrix red here. Retry, then
@@ -494,6 +499,6 @@ jobs:
             echo 'Legend: ✅ upgrade passed · known [n] = exact historical failure, see footnote · ❌ unexpected failure · pre-desktop / TODO = why a leg skipped · 📼 opens the leg player (recording + synced logs)'
             echo
             node scripts/sandbox/generate-e2e-matrix.mjs --format results \
-              --tags '${{ needs.pick-releases.outputs.tags }}' \
+              --tags "$RELEASE_TAGS" \
               --artifacts /tmp/e2e-artifacts.ndjson < /tmp/e2e-jobs.ndjson
           } >> "$GITHUB_STEP_SUMMARY"
