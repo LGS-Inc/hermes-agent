@@ -13,7 +13,8 @@ name: Sync Fork with Upstream
 # with Contents: read and write, and Workflows: read and write.
 #
 # Repository invariant: main is upstream/main plus exactly one LGS commit
-# containing this workflow. Every run rebuilds that shape from upstream and
+# containing this workflow and the fork's install E2E workflow/driver fixes.
+# Every run rebuilds that shape from upstream and
 # updates main with an explicit lease. It never merges and never uses an
 # unrestricted force push.
 
@@ -50,7 +51,7 @@ jobs:
           echo "WORKFLOW_TOKEN is present."
 
       - name: Check out current main
-        uses: actions/checkout@v4
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -78,6 +79,16 @@ jobs:
           git fetch origin main
           git fetch upstream main
 
+          # Fork creation does not copy upstream release tags. Every E2E
+          # checkout needs these immutable baselines, not just upstream main.
+          mapfile -t RELEASE_REFS < <(git ls-remote --tags --refs upstream 'v*' |
+            awk '{print $2}' | grep -E '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$')
+          [ "${#RELEASE_REFS[@]}" -gt 0 ] || { echo '::error::No upstream stable release tags'; exit 1; }
+          RELEASE_FETCH=()
+          for ref in "${RELEASE_REFS[@]}"; do RELEASE_FETCH+=("${ref}:${ref}"); done
+          git fetch --no-tags upstream "${RELEASE_FETCH[@]}"
+          git push --atomic origin "${RELEASE_REFS[@]}"
+
           EXPECTED_ORIGIN_MAIN=$(git rev-parse refs/remotes/origin/main)
           UPSTREAM_MAIN=$(git rev-parse refs/remotes/upstream/main)
 
@@ -92,6 +103,11 @@ jobs:
           fi
 
           CURRENT_PARENT=$(git rev-parse "${EXPECTED_ORIGIN_MAIN}^")
+          # A repair may add commits before the next scheduled rebuild.
+          # Find the underlying upstream tree so all fork fixes survive.
+          while git cat-file -e "${CURRENT_PARENT}:.github/workflows/sync-fork.yml" 2>/dev/null; do
+            CURRENT_PARENT=$(git rev-parse "${CURRENT_PARENT}^")
+          done
           if git merge-base --is-ancestor "${CURRENT_PARENT}" "${UPSTREAM_MAIN}"; then
             SYNC_PATH=fast-forward-upstream
           else
@@ -101,10 +117,17 @@ jobs:
 
           WORKFLOW_COPY=$(mktemp)
           cp .github/workflows/sync-fork.yml "${WORKFLOW_COPY}"
+          E2E_PATCH=$(mktemp)
+          git diff "${CURRENT_PARENT}" "${EXPECTED_ORIGIN_MAIN}" -- .github/workflows/install-e2e.yml .github/workflows/install-e2e-windows-run.yml tests/install/macos-desktop-e2e.sh tests/install/windows-e2e.ps1 > "${E2E_PATCH}"
 
           git checkout --detach "${UPSTREAM_MAIN}"
           mkdir -p .github/workflows
           cp "${WORKFLOW_COPY}" .github/workflows/sync-fork.yml
+          # Replay the narrow fork fix against new upstream content; stop on
+          # conflicts instead of silently discarding either side's changes.
+          if [ -s "${E2E_PATCH}" ]; then
+            git apply --3way "${E2E_PATCH}"
+          fi
           git add .github/workflows/sync-fork.yml
 
           if git diff --cached --quiet; then
@@ -123,8 +146,8 @@ jobs:
             echo "::error::Candidate is not exactly one commit ahead of upstream/main."
             exit 1
           fi
-          if [ "$(git diff-tree --no-commit-id --name-only -r HEAD)" != ".github/workflows/sync-fork.yml" ]; then
-            echo "::error::Candidate commit changes files beyond sync-fork.yml."
+          if git diff-tree --no-commit-id --name-only -r HEAD | grep -vE '^(\.github/workflows/(sync-fork|install-e2e|install-e2e-windows-run)\.yml|tests/install/(macos-desktop-e2e\.sh|windows-e2e\.ps1))$'; then
+            echo "::error::Candidate commit changes files beyond the approved fork CI fixes."
             git diff-tree --no-commit-id --name-only -r HEAD
             exit 1
           fi
